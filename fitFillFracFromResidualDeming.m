@@ -31,7 +31,6 @@ function fitOut = fitFillFracFromResidualDeming(subjectReal, stimData, fillGrid,
 %       .resBestSimSlope  same for simulated data at bestFillFrac
 %       .resSimSlope      [nVox x nF] all sim residual slopes
 %       .realSlope        original (non-residual) deming slope, for plotting
-%       .nVoxUsed
 
     if nargin < 5 || isempty(simOpts), simOpts = struct(); end
     if nargin < 6 || isempty(demingOpts), demingOpts = struct(); end
@@ -56,7 +55,6 @@ function fitOut = fitFillFracFromResidualDeming(subjectReal, stimData, fillGrid,
     nVox = numel(resRealSlope);
     resSimSlope = nan(nVox, nF);
     sse         = nan(nF, 1);
-    nVoxUsed    = nan(nF, 1);
 
     simOptsLocal = simOpts;
     simOptsLocal.verbose = false;
@@ -76,8 +74,7 @@ function fitOut = fitFillFracFromResidualDeming(subjectReal, stimData, fillGrid,
 
         ok = isfinite(resRealSlope) & isfinite(tmpSlope);
         d  = resRealSlope(ok) - tmpSlope(ok);
-        sse(k)      = sum(d.^2);
-        nVoxUsed(k) = nnz(ok);
+        sse(k) = sum(d.^2);
 
         fprintf('%d of %d, f = %g, sse = %0.2f\n', k, nF, f, sse(k));
     end
@@ -93,5 +90,4 @@ function fitOut = fitFillFracFromResidualDeming(subjectReal, stimData, fillGrid,
     fitOut.resBestSimSlope = resSimSlope(:,idx);
     fitOut.resSimSlope     = resSimSlope;
     fitOut.realSlope       = realSlope;
-    fitOut.nVoxUsed        = nVoxUsed;
 end

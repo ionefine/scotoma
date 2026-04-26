@@ -19,6 +19,12 @@ function beta = voxelDemingSlopeMap(subjectData, opts)
 %
 % OUTPUT
 %   beta [nVox x 1]
+%
+% NaN handling: samples where Yfull or Yscot is non-finite are excluded
+% per voxel (per column) from the slope calculation. Centering uses
+% finite samples only. Voxels with fewer than 2 valid samples produce
+% NaN slopes; this is consistent across both 'concat' and 'mean'
+% combineRuns modes.
 
     if nargin < 2 || isempty(opts), opts = struct(); end
     if ~isfield(opts, 'lambda'),             opts.lambda = 1; end
@@ -41,12 +47,9 @@ function beta = voxelDemingSlopeMap(subjectData, opts)
                 X = double(subjectData.Yfull{r});
                 Y = double(subjectData.Yscot{r});
 
-                X(~isfinite(X)) = 0;
-                Y(~isfinite(Y)) = 0;
-
                 if opts.centerData
-                    X = X - mean(X, 1);
-                    Y = Y - mean(Y, 1);
+                    X = X - mean(X, 1, 'omitnan');
+                    Y = Y - mean(Y, 1, 'omitnan');
                 end
 
                 Xall = [Xall; X]; %#ok<AGROW>
@@ -63,12 +66,9 @@ function beta = voxelDemingSlopeMap(subjectData, opts)
                 X = double(subjectData.Yfull{r});
                 Y = double(subjectData.Yscot{r});
 
-                X(~isfinite(X)) = 0;
-                Y(~isfinite(Y)) = 0;
-
                 if opts.centerData
-                    X = X - mean(X, 1);
-                    Y = Y - mean(Y, 1);
+                    X = X - mean(X, 1, 'omitnan');
+                    Y = Y - mean(Y, 1, 'omitnan');
                 end
 
                 betaRuns(r,:) = localDemingColumns(X, Y, opts.lambda, ...
@@ -76,7 +76,6 @@ function beta = voxelDemingSlopeMap(subjectData, opts)
             end
 
             beta = mean(betaRuns, 1, 'omitnan')';
-            beta(isnan(beta)) = 0; % deal with zero slope
 
         otherwise
             error('opts.combineRuns must be ''concat'' or ''mean''.');
@@ -86,30 +85,38 @@ end
 
 function beta = localDemingColumns(X, Y, lambda, forceZeroIntercept, minDen)
 % Columnwise Deming slopes for paired matrices X and Y.
+% NaN/Inf samples are excluded per column (per voxel).
 % X, Y are [nT x nVox], beta is [1 x nVox]
 
+    mask = isfinite(X) & isfinite(Y);
+    X(~mask) = 0;
+    Y(~mask) = 0;
+    nValid = sum(mask, 1);
+    den    = max(nValid, 1);  % avoid divide-by-zero; voxel filtered below
+
     if forceZeroIntercept
-        sx2 = mean(X.^2, 1);
-        sy2 = mean(Y.^2, 1);
-        sxy = mean(X .* Y, 1);
+        sx2 = sum(X.^2,    1) ./ den;
+        sy2 = sum(Y.^2,    1) ./ den;
+        sxy = sum(X .* Y,  1) ./ den;
     else
-        mx = mean(X,1);
-        my = mean(Y,1);
-        Xc = X - mx;
-        Yc = Y - my;
-        sx2 = mean(Xc.^2, 1);
-        sy2 = mean(Yc.^2, 1);
-        sxy = mean(Xc .* Yc, 1);
+        mx = sum(X, 1) ./ den;
+        my = sum(Y, 1) ./ den;
+        Xc = (X - mx) .* mask;   % invalid samples stay at 0
+        Yc = (Y - my) .* mask;
+        sx2 = sum(Xc.^2,    1) ./ den;
+        sy2 = sum(Yc.^2,    1) ./ den;
+        sxy = sum(Xc .* Yc, 1) ./ den;
     end
 
     disc = (sy2 - lambda .* sx2).^2 + 4 .* lambda .* (sxy.^2);
 
     beta = nan(1, size(X,2));
     ok = isfinite(sx2) & isfinite(sy2) & isfinite(sxy) & ...
-         (abs(sxy) > minDen) & isfinite(disc) & (disc >= 0);
+         (abs(sxy) > minDen) & isfinite(disc) & (disc >= 0) & ...
+         (nValid >= 2);
 
     beta(ok) = (sy2(ok) - lambda .* sx2(ok) + sqrt(disc(ok))) ./ ...
                (2 .* sxy(ok));
 
-    beta(sy2<minDen) = 0;  % set slope to zero if no variabity in y.
+    beta(sy2 < minDen) = 0;  % no variability in y -> slope = 0
 end
