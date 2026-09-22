@@ -1,76 +1,68 @@
-function [subjectDataSub, stimDataSub] = subsetSubjectDataByVoxel(subjectData, stimData, compileOpts)
-% subsetSubjectDataByVoxel
+function [subjectDataSub,stimDataSub,keepIdx] = subsetSubjectDataByVoxel(subjectData,stimData,compileOpts)
+% subsetSubjectDataByVoxel  Select voxels while preserving subject metadata.
 %
-% Subset a subjectData struct to only include selected voxels.
-%
-% INPUTS
-%   subjectData   struct for one subject
-%   stimData      stimulus struct (passed through unchanged)
-%   compileOpts
-%
-% OUTPUTS
-%   subjectDataSub   same structure but with voxel dimension reduced
-%   stimDataSub      identical to input stimData
-%
-% The function subsets all fields that depend on voxels:
-%   - Yfull{r}   [nT x nVox]
-%   - Yscot{r}
-%   - prfXY      [nVox x 2]
-%   - sigma      [nVox x 1]
-%   - w_vox      [nVox x 1] (optional)
-%   - Gprf       [nPix x nVox] (optional)
+% Bins use (lower,upper], matching prfShiftFigure, so a voxel exactly on an
+% internal edge belongs to one bin rather than being dropped from both.
 
-allr = sqrt(subjectData.prfXY(:,1).^2+subjectData.prfXY(:,2).^2);  % pRF distance from fovea
-
-keepIdx  = allr-compileOpts.edgeSigma*subjectData.sigma> compileOpts.radRange(1)  & ...
-    allr+compileOpts.edgeSigma*subjectData.sigma < compileOpts.radRange(2) &...
-    subjectData.w_vox(:) >compileOpts.minvexpl & subjectData.sigma(:)>compileOpts.minSigma;
-
-nKeep = sum(keepIdx);
-
-if nKeep == 0
-    warning('No voxels selected (keepIdx all false).');
-else
-    fprintf('keeping %d of %d voxels\n',nKeep,length(allr));
+requiredOpts = {'radRange','minvexpl','minSigma','edgeSigma'};
+if nargin < 3 || ~all(isfield(compileOpts,requiredOpts))
+    error('subsetSubjectDataByVoxel:missingOptions','compileOpts lacks required fields.');
 end
+if numel(compileOpts.radRange) ~= 2 || any(isnan(compileOpts.radRange)) || ...
+   compileOpts.radRange(2) <= compileOpts.radRange(1) || ...
+   ~isscalar(compileOpts.edgeSigma) || ~isfinite(compileOpts.edgeSigma) || ...
+   compileOpts.edgeSigma < 0
+    error('subsetSubjectDataByVoxel:badOptions','Invalid radRange or edgeSigma.');
+end
+requiredData = {'Yfull','Yscot','prfXY','sigma','w_vox','Gprf'};
+if ~all(isfield(subjectData,requiredData))
+    error('subsetSubjectDataByVoxel:missingData','subjectData lacks required fields.');
+end
+nVox = size(subjectData.prfXY,1);
+if size(subjectData.prfXY,2) ~= 2 || numel(subjectData.sigma) ~= nVox
+    error('subsetSubjectDataByVoxel:badPRF','prfXY and sigma dimensions disagree.');
+end
+if numel(subjectData.w_vox) ~= nVox
+    error('subsetSubjectDataByVoxel:badWeights','w_vox has the wrong length.');
+end
+w = subjectData.w_vox(:);
+
+sigma = subjectData.sigma(:);
+ecc = hypot(subjectData.prfXY(:,1),subjectData.prfXY(:,2));
+lo = ecc-compileOpts.edgeSigma*sigma;
+hi = ecc+compileOpts.edgeSigma*sigma;
+keepIdx = lo > compileOpts.radRange(1) & hi <= compileOpts.radRange(2) & ...
+          w > compileOpts.minvexpl & sigma > compileOpts.minSigma & ...
+          isfinite(ecc) & isfinite(sigma) & isfinite(w);
+fprintf('keeping %d of %d voxels\n',nnz(keepIdx),nVox)
 
 subjectDataSub = subjectData;
-
-% ---------------- Yfull / Yscot ----------------
-if isfield(subjectData, 'Yfull')
-    for r = 1:numel(subjectData.Yfull)
-        Y = subjectData.Yfull{r};
-        subjectDataSub.Yfull{r} = Y(:, keepIdx);
+for r = 1:numel(subjectData.Yfull)
+    if size(subjectData.Yfull{r},2) ~= nVox
+        error('subsetSubjectDataByVoxel:badYfull','Yfull{%d} has the wrong voxel count.',r);
     end
+    subjectDataSub.Yfull{r} = subjectData.Yfull{r}(:,keepIdx);
 end
-
-if isfield(subjectData, 'Yscot')
-    for r = 1:numel(subjectData.Yscot)
-        Y = subjectData.Yscot{r};
-        subjectDataSub.Yscot{r} = Y(:, keepIdx);
+for r = 1:numel(subjectData.Yscot)
+    if size(subjectData.Yscot{r},2) ~= nVox
+        error('subsetSubjectDataByVoxel:badYscot','Yscot{%d} has the wrong voxel count.',r);
     end
+    subjectDataSub.Yscot{r} = subjectData.Yscot{r}(:,keepIdx);
 end
-
-% ---------------- pRF parameters ----------------
-if isfield(subjectData, 'prfXY')
-    subjectDataSub.prfXY = subjectData.prfXY(keepIdx, :);
+subjectDataSub.prfXY = subjectData.prfXY(keepIdx,:);
+subjectDataSub.sigma = subjectData.sigma(keepIdx);
+subjectDataSub.w_vox = subjectData.w_vox(keepIdx);
+% Hemisphere label and its index into stimData.hrfParams must follow the
+% voxels, or a later fit will convolve with the wrong hemisphere's HRF.
+if isfield(subjectData,'hemisphere')
+    subjectDataSub.hemisphere = subjectData.hemisphere(keepIdx);
 end
-
-if isfield(subjectData, 'sigma')
-    subjectDataSub.sigma = subjectData.sigma(keepIdx);
+if isfield(subjectData,'hemIdx')
+    subjectDataSub.hemIdx = subjectData.hemIdx(keepIdx);
 end
-
-if isfield(subjectData, 'w_vox')
-    subjectDataSub.w_vox = subjectData.w_vox(keepIdx);
+if size(subjectData.Gprf,2) ~= nVox
+    error('subsetSubjectDataByVoxel:badGprf','Gprf has the wrong voxel count.');
 end
-
-% ---------------- Gprf (if present) ----------------
-if isfield(subjectData, 'Gprf')
-    % Gprf is [nPix x nVox]
-    subjectDataSub.Gprf = subjectData.Gprf(:, keepIdx);
-end
-
-% ---------------- stimData unchanged ----------------
+subjectDataSub.Gprf = subjectData.Gprf(:,keepIdx);
 stimDataSub = stimData;
-
 end

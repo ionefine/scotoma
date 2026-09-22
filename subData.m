@@ -1,9 +1,9 @@
 function [bold,prfs] = subData(fullBold,fullPrfs,id)
-% bold = subBold(fullBold,id)
+% [bold,prfs] = subData(fullBold,fullPrfs,id)  Subset matched bold and pRF data.
 bold.vertex = fullBold.vertex(id);
 bold.varea = fullBold.varea(id);
 bold.data = fullBold.data(:,id);
-bold.hemisphere = fullBold.data(id);
+bold.hemisphere = fullBold.hemisphere(id);
 
 
 prfs.vertex = fullPrfs.vertex(id);
