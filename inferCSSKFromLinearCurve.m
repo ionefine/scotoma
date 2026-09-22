@@ -143,12 +143,12 @@ for s = 1:nSub
             error('inferCSSKFromLinearCurve:gridMismatch', ...
                   'Stimulus and pRF grids disagree for subject %d.',s);
         end
-        driveFCSS{r} = max(Afull{r}*Gcss,0);
-        driveSCSS{r} = max(Ascot{r}*Gcss,0);
-        driveDCSS{r} = max((Afull{r}-Ascot{r})*Gcss,0);
-        driveFLinear = max(Afull{r}*Glinear,0);
-        driveSLinear = max(Ascot{r}*Glinear,0);
-        driveDLinear = max((Afull{r}-Ascot{r})*Glinear,0);
+        driveFCSS{r} = nonnegative(Afull{r}*Gcss);
+        driveSCSS{r} = nonnegative(Ascot{r}*Gcss);
+        driveDCSS{r} = nonnegative((Afull{r}-Ascot{r})*Gcss);
+        driveFLinear = nonnegative(Afull{r}*Glinear);
+        driveSLinear = nonnegative(Ascot{r}*Glinear);
+        driveDLinear = nonnegative((Afull{r}-Ascot{r})*Glinear);
         fullTrue{r} = cssPredict(driveFCSS{r},trueN,hrf,opts.TR,hemIdxKeep,r);
         fullLinear{r} = cssPredict(driveFLinear,1,hrf,opts.TR,hemIdxKeep,r);
         scotLinear{r} = cssPredict(driveSLinear,1,hrf,opts.TR,hemIdxKeep,r);
@@ -403,5 +403,9 @@ end
 
 function Y = cssPredict(drive,n,hrf,TR,hemIdx,r)
 % hrf{h}{r} is hemisphere h on run r; the exponent precedes convolution.
-Y = centre(convByHemisphere(max(drive,0).^n,hrf,TR,hemIdx,r));
+Y = centre(convByHemisphere(nonnegative(drive).^n,hrf,TR,hemIdx,r));
+end
+
+function X = nonnegative(X)
+X(isfinite(X) & X < 0) = 0;
 end

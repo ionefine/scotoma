@@ -20,10 +20,22 @@ if numel(hemIdx) ~= nVox
     error('convByHemisphere:badHemIdx', ...
           'hemIdx has %d entries but X has %d columns.',numel(hemIdx),nVox);
 end
+if any(~isfinite(hemIdx) | hemIdx ~= round(hemIdx) | ...
+       hemIdx < 1 | hemIdx > numel(hrf))
+    error('convByHemisphere:badHemIdx', ...
+          'Every hemIdx entry must be an integer indexing hrf.');
+end
+if ~iscell(hrf) || isempty(hrf) || ~isscalar(r) || r ~= round(r) || r < 1
+    error('convByHemisphere:badHRF','hrf must be a nonempty cell array and r a positive integer.');
+end
 Y = zeros(size(X));
 for h = 1:numel(hrf)
     c = (hemIdx == h);
     if ~any(c), continue, end
+    if ~iscell(hrf{h}) || numel(hrf{h}) < r
+        error('convByHemisphere:missingRunHRF', ...
+              'No HRF was supplied for hemisphere %d, run %d.',h,r);
+    end
     Y(:,c) = convHRF(X(:,c),hrf{h}{r},TR);
 end
 end

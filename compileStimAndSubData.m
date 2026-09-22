@@ -4,7 +4,8 @@ function [subjectData,stimData,x,y] = compileStimAndSubData(compileOpts)
 % HRF parameters are read per hemisphere by loadHRFParams. The hrfParams
 % stored inside each pRF MAT file is the right-hemisphere fit for every
 % subject and is deliberately ignored; compileOpts.hrfParams overrides the
-% table if supplied (one struct for both hemispheres, or two as {L,R}).
+% table if supplied (one struct for both hemispheres, or a two-element
+% struct/cell array ordered {L,R}).
 %
 % VOXEL ELIGIBILITY (applied once here and reused by every later analysis):
 %   1. voxel belongs to the requested visual area;
@@ -17,18 +18,11 @@ function [subjectData,stimData,x,y] = compileStimAndSubData(compileOpts)
 
 if nargin < 1 || isempty(compileOpts), compileOpts = struct(); end
 if ~isfield(compileOpts,'ROI'),       compileOpts.ROI = 1; end
-if ~isfield(compileOpts,'radRange'),  compileOpts.radRange = [0,8]; end
+if ~isfield(compileOpts,'radRange'),  compileOpts.radRange = [0,5]; end
 if ~isfield(compileOpts,'minvexpl'),  compileOpts.minvexpl = 0.2; end
 if ~isfield(compileOpts,'minSigma'),  compileOpts.minSigma = 0.1; end
 if ~isfield(compileOpts,'subList'),   compileOpts.subList = 1:10; end
 if ~isfield(compileOpts,'edgeSigma'), compileOpts.edgeSigma = 0; end
-if ~isfield(compileOpts,'loadPRFFitRuns'), compileOpts.loadPRFFitRuns = false; end
-if ~isfield(compileOpts,'prfBoldPattern')
-    compileOpts.prfBoldPattern = 'data/sub-%02g/sub-%02g_ses-study1_task-logbar_run-%g_bold.mat';
-end
-if ~isfield(compileOpts,'prfStimPattern')
-    compileOpts.prfStimPattern = 'data/stimuli/ses-study1_task-logbar_run-%g*.mat';
-end
 validateattributes(compileOpts.ROI,{'numeric'},{'scalar','integer','positive','finite'});
 validateattributes(compileOpts.radRange,{'numeric'},{'vector','numel',2,'real','finite'});
 if compileOpts.radRange(1) < 0 || compileOpts.radRange(2) <= compileOpts.radRange(1)
@@ -57,9 +51,6 @@ validateattributes(compileOpts.edgeSigma,{'numeric'},{'scalar','real','finite','
 %
 %   .Yscot{r}       [nT_r x nVox]
 %                   measured scotoma-stimulus timecourses for run r
-%
-%   .Yprf{r}        [nT_r x nVox], when loadPRFFitRuns is true
-%                   independent full-field runs used to estimate pRFs
 %
 % stimData is a cell array, one entry per subject, because each subject has
 % their own fitted HRF. Each entry has:
@@ -90,6 +81,8 @@ if any(subList < 1 | subList > numel(allSubs) | subList ~= round(subList))
 end
 subjectData = cell(numel(subList),1);
 stimData = cell(numel(subList),1);
+x = [];
+y = [];
 
 TR = 1.2; % acquisition repetition time (seconds)
 
@@ -120,6 +113,17 @@ for si = 1:numel(subList)
     % and for the published table this reads instead.
     if isfield(compileOpts,'hrfParams')
         supplied = compileOpts.hrfParams;
+        if iscell(supplied)
+            if ~all(cellfun(@(v) isstruct(v) && isscalar(v),supplied))
+                error('compileStimAndSubData:badHRFOverride', ...
+                      'Every hrfParams cell must contain one scalar struct.');
+            end
+            supplied = [supplied{:}];
+        end
+        if ~isstruct(supplied)
+            error('compileStimAndSubData:badHRFOverride', ...
+                  'compileOpts.hrfParams must contain HRF parameter structs.');
+        end
         if isscalar(supplied)
             hrfParamsThis = [supplied,supplied]; % caller forces one HRF on both
         elseif numel(supplied) == 2
@@ -148,12 +152,12 @@ for si = 1:numel(subList)
     sigma = double(allPrfs.sigma(:));
     vexpl = double(allPrfs.vexpl(:));
     varea = double(allPrfs.varea(:));
-    hemAll = allPrfs.hemisphere(:);
+    hemAll = string(allPrfs.hemisphere(:));
     if numel(unique([numel(x0),numel(y0),numel(sigma),numel(vexpl),numel(varea), ...
                      numel(hemAll)])) ~= 1
         error('compileStimAndSubData:prfFieldSizes','pRF fields in %s have different lengths.',prfName);
     end
-    if ~iscellstr(hemAll) || ~all(ismember(upper(strtrim(hemAll)),{'L','R'})) %#ok<ISCLSTR>
+    if ~all(ismember(upper(strtrim(hemAll)),["L","R"]))
         error('compileStimAndSubData:badHemisphere', ...
               'prfs.hemisphere in %s must contain only L and R labels.',prfName);
     end
@@ -176,47 +180,8 @@ for si = 1:numel(subList)
     subjectData{si}.prfXY = [x0(id),y0(id)];
     subjectData{si}.sigma = sigma(id);
     % Hemisphere label per retained voxel, and its index into hrfParams.
-    % Taken from allPrfs directly: subData.m corrupts the copy in the bold
-    % struct (it reads .data instead of .hemisphere).
-    subjectData{si}.hemisphere = upper(strtrim(hemAll(id)));
+    subjectData{si}.hemisphere = cellstr(upper(strtrim(hemAll(id))));
     subjectData{si}.hemIdx = uint8(1+strcmp(subjectData{si}.hemisphere,'R'));
-
-    if compileOpts.loadPRFFitRuns
-        subjectData{si}.Yprf = cell(1,3);
-        stimData{si}.Aprf = cell(1,3);
-        stimData{si}.tPrf = cell(1,3);
-        for runNum = 1:3
-            boldName = sprintf(compileOpts.prfBoldPattern,subNum,subNum,runNum);
-            if ~isfile(boldName)
-                error('compileStimAndSubData:missingPRFFitRun', ...
-                    ['Independent pRF-fitting run not found:\n%s\n', ...
-                     'If the filename differs, set compileOpts.prfBoldPattern.'],boldName);
-            end
-            tmpBold = load(boldName);
-            if ~isfield(tmpBold,'bold')
-                error('compileStimAndSubData:badPRFFitRun','%s does not contain bold.',boldName);
-            end
-            prfBold = subData(tmpBold.bold,allPrfs,id);
-            subjectData{si}.Yprf{runNum} = prfBold.data;
-            [prfStim,prfFunc] = loadIndependentPRFStimulus( ...
-                compileOpts.prfStimPattern,runNum,TR);
-            if si == 1 && runNum == 1
-                x = prfFunc.x; y = prfFunc.y;
-            elseif ~isequal(size(x),size(prfFunc.x)) || ...
-                    max(abs(x(:)-prfFunc.x(:))) > 1e-10 || ...
-                    max(abs(y(:)-prfFunc.y(:))) > 1e-10
-                error('compileStimAndSubData:prfGridMismatch', ...
-                    'Independent pRF stimulus grid differs for subject %d, run %d.',subNum,runNum);
-            end
-            ntPrf = numel(prfFunc.t);
-            stimData{si}.Aprf{runNum} = reshape(double(prfStim),[],ntPrf).';
-            stimData{si}.tPrf{runNum} = double(prfFunc.t(:).');
-            if size(subjectData{si}.Yprf{runNum},1) ~= ntPrf
-                error('compileStimAndSubData:prfTimeMismatch', ...
-                    'Independent BOLD and stimulus lengths differ for subject %d, run %d.',subNum,runNum);
-            end
-        end
-    end
 
     for runNum = 1:3
         fprintf('subject %d, run %d ',subNum,runNum)
@@ -264,6 +229,10 @@ for si = 1:numel(subList)
             error('compileStimAndSubData:gridMismatch', ...
                   'Stimulus grid differs for subject %d, run %d.',subNum,runNum);
         end
+        if runNum == 1
+            stimData{si}.x = double(xr);
+            stimData{si}.y = double(yr);
+        end
         nx = size(funcOf.x,2);
         ny = size(funcOf.x,1);
         nt = length(funcOf.t);
@@ -278,33 +247,33 @@ for si = 1:numel(subList)
 
         subjectData{si}.Yfull{runNum} = bold.full.data;
         subjectData{si}.Yscot{runNum} = bold.scotoma.data;
+        if size(subjectData{si}.Yfull{runNum},1) ~= nt || ...
+                size(subjectData{si}.Yscot{runNum},1) ~= nt || ...
+                size(subjectData{si}.Yfull{runNum},2) ~= nVox || ...
+                size(subjectData{si}.Yscot{runNum},2) ~= nVox
+            error('compileStimAndSubData:boldStimulusMismatch', ...
+                  'BOLD and comparison-stimulus dimensions differ for subject %d, run %d.', ...
+                  subNum,runNum);
+        end
 
         %%
         % Generate the design matrix X
 
-        G = zeros(nx*ny,nVox);
-
-
-        pRF = [];
-        for i=1:nVox
-            pRF(i).center = [prfs.x0(i),prfs.y0(i)];
-            pRF(i).sig = prfs.sigma(i);
-            pRF(i).ar = 1;
-            G(:,i) = Gauss(pRF(i),x,y,1);
+        if runNum == 1
+            G = zeros(nx*ny,nVox);
+            for i = 1:nVox
+                pRF = struct('center',[prfs.x0(i),prfs.y0(i)], ...
+                             'sig',prfs.sigma(i),'ar',1);
+                G(:,i) = Gauss(pRF,x,y,1);
+            end
+            % Unit mass makes beta carry response amplitude independently of
+            % pRF size and is required by every downstream decomposition.
+            area = sum(G,1);
+            if any(~isfinite(G(:))) || any(~isfinite(area) | area <= 0)
+                error('compileStimAndSubData:badGaussian','A pRF has zero or invalid mass.');
+            end
+            subjectData{si}.Gprf = G./area;
         end
-
-
-
-        % Normalize the pRFs to have equal area (not height).
-        % This seems to matter
-        area = sum(G,1);
-        if any(~isfinite(area) | area <= 0)
-            error('compileStimAndSubData:badGaussian','A pRF has zero or invalid mass.');
-        end
-        G = G./area;
-
-
-        subjectData{si}.Gprf = G;
 
 
         % Reshape to the matrix S: columns of S are one pixel's time course,
@@ -324,41 +293,4 @@ for si = 1:numel(subList)
     end
     clear id
 end
-end
-
-function [stimImg,funcOf] = loadIndependentPRFStimulus(pattern,runNum,TR)
-filePattern = sprintf(pattern,runNum);
-files = dir(filePattern);
-if numel(files) ~= 1
-    error('compileStimAndSubData:prfStimulusFileCount', ...
-        ['Expected one independent pRF stimulus matching:\n%s\n', ...
-         'Found %d. Set compileOpts.prfStimPattern to the correct pattern.'], ...
-         filePattern,numel(files));
-end
-src = load(fullfile(files.folder,files.name));
-if ~isfield(src,'stimImg') || ~isfield(src,'funcOf') || ...
-        ~all(isfield(src.funcOf,{'t','x','y'}))
-    error('compileStimAndSubData:badPRFStimulus', ...
-        '%s lacks stimImg or funcOf.t/x/y.',files.name);
-end
-raw = double(src.stimImg);
-funcOf = src.funcOf;
-tRaw = double(funcOf.t(:));
-if numel(tRaw) < 2 || any(~isfinite(tRaw)) || any(diff(tRaw) <= 0) || ...
-        abs(tRaw(1)) > 1e-9 || ndims(raw) ~= 3 || size(raw,1) ~= numel(tRaw) || ...
-        ~isequal(size(funcOf.x),size(funcOf.y)) || ...
-        size(raw,2) ~= size(funcOf.x,1) || size(raw,3) ~= size(funcOf.x,2) || ...
-        any(~isfinite(raw(:))) || any(~isfinite(funcOf.x(:))) || any(~isfinite(funcOf.y(:)))
-    error('compileStimAndSubData:badPRFStimulusDimensions', ...
-          '%s has inconsistent stimulus, time, or grid dimensions.',files.name);
-end
-t = (0:TR:tRaw(end)).';
-flat = reshape(raw,numel(tRaw),[]);
-flat = interp1(tRaw,flat,t,'linear');
-if any(~isfinite(flat(:)))
-    error('compileStimAndSubData:prfInterpolation', ...
-          'Stimulus interpolation produced invalid values for %s.',files.name);
-end
-stimImg = permute(reshape(flat,[numel(t),size(raw,2),size(raw,3)]),[2 3 1]);
-funcOf.t = t.';
 end

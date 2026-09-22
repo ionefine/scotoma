@@ -20,7 +20,7 @@ function out = fitKSpatialSummation(subjectData,stimData,nGrid,eccEdges,opts)
 %   stimData     matching cell array; each entry needs .hrfParams (1x2,
 %                {L,R}) and .SfullRaw/.SscotRaw. subjectData needs .hemIdx.
 %   nGrid        positive CSS exponents; include 1 for the linear baseline
-%   eccEdges     eccentricity bin edges, using bins (lower,upper]
+%   eccEdges     eccentricity bin edges, using MATLAB discretize convention
 %   opts.TR       repetition time                         (default 1.2)
 %       .kBounds  bounds for k                            (default [0 1])
 %       .tolK     fminbnd tolerance                       (default 0.001)
@@ -179,11 +179,7 @@ for s = 1:nSub
     end
     ecc = hypot(S.prfXY(:,1),S.prfXY(:,2));
     massIn = sum(G(dPix,:),1).';
-    bin = nan(nVox,1);
-    for b = 1:nBin
-        q = ecc > eccEdges(b) & ecc <= eccEdges(b+1);
-        bin(q) = b;
-    end
+    bin = discretize(ecc,eccEdges);
 
     Yfull = cell(nRun,1); Yscot = cell(nRun,1);
     driveF = cell(nRun,1); driveS = cell(nRun,1); driveD = cell(nRun,1);
@@ -215,9 +211,9 @@ for s = 1:nSub
         end
         Yfull{r} = centre(double(S.Yfull{r}));
         Yscot{r} = centre(double(S.Yscot{r}));
-        driveF{r} = max(Afull{r}*G,0);
-        driveS{r} = max(Ascot{r}*G,0);
-        driveD{r} = max(driveF{r}-driveS{r},0);
+        driveF{r} = nonnegative(Afull{r}*G);
+        driveS{r} = nonnegative(Ascot{r}*G);
+        driveD{r} = nonnegative((Afull{r}-Ascot{r})*G);
         % The locally loaded raw stimulus must match the one
         % compileStimAndSubData stored. This catches a wrong reshape or a
         % stimulus/grid mismatch between the two independent load paths,
@@ -331,7 +327,7 @@ end
 function Y = cssPredict(drive,n,hrf,TR,hemIdx,r)
 % hrf{h}{r} is hemisphere h on run r; hemIdx says which hemisphere each
 % column of drive belongs to. The exponent is applied before convolution.
-neural = bsxfun(@power,max(drive,0),double(n));
+neural = bsxfun(@power,nonnegative(drive),double(n));
 Y = centre(convByHemisphere(neural,hrf,TR,hemIdx,r));
 end
 
@@ -374,4 +370,8 @@ end
 
 function Z = centre(Z)
 Z = Z-mean(Z,1,'omitnan');
+end
+
+function X = nonnegative(X)
+X(isfinite(X) & X < 0) = 0;
 end

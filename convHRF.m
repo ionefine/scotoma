@@ -15,6 +15,14 @@ function Y = convHRF(X,hrf,TR)
 % It does NOT commute with the CSS exponent, so CSS callers must project,
 % raise to the power n, and only then convolve.
 
-Y = TR*conv2(X,hrf(:),'full');
+validateattributes(TR,{'numeric'},{'real','finite','scalar','positive'},mfilename,'TR');
+if ~isnumeric(X) || ndims(X) ~= 2
+    error('convHRF:badInput','X must be a numeric time-by-column matrix.');
+end
+hrf = double(hrf(:));
+if isempty(hrf) || any(~isfinite(hrf))
+    error('convHRF:badHRF','hrf must be a nonempty finite vector.');
+end
+Y = TR*conv2(double(X),hrf,'full');
 Y = Y(1:size(X,1),:);
 end

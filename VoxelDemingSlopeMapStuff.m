@@ -1,163 +1,129 @@
 % VoxelDemingSlopeMapStuff
 %
-% Generates 'k' statistics across eccentricity bins for each subject,
-% computes meand and SD's and saves the results in matlab file
-% 'V%X_sigmaFac_Y'  where X is the visual area ('V1, V2 or V3)' and Y is
-% the sigma scale factor (1, 2 or 3).  Should be run separately for each
-% combination of visual area and sigma scale factor.
-%
-% After this, run 'CompileKStats.m' to load in each of the 9 files and save
-% results as a csv file in long format to be used for plotting in
-% 'MakeScotomaFigure.m'  in the ../text/papers/scotoma/matlab' directory.
+% Estimate Deming-grid k separately in each eccentricity bin and subject.
+% Also save the response-space effects r = slope-(1-m) and rExact =
+% slope-(the simulated k=0 slope). This script does not estimate the
+% fixed-pRF regression k or k2; those are reported by prfShiftFigure.
 
-sigmaFac = 1;  % control to test robusteness of pRF size estimates
+compileRequest.ROI = 1;
+compileRequest.radRange = [0,4];
+compileRequest.minvexpl = 0.2;
+compileRequest.minSigma = 0.1;
+compileRequest.subList = 1:10;
+compileRequest.edgeSigma = 0;
 
-
-if ~exist('subjectData','var')
-    compileOpts.ROI = 3;
-    compileOpts.radRange = [0,4];
-    compileOpts.minvexpl = 0.2;  %
-    compileOpts.minSigma = 0.1;
-    compileOpts.subList = 1:10;
-    compileOpts.edgeSigma = 0;
-    [subjectData,stimData,x,y] = compileStimAndSubData(compileOpts);
+% Reuse compiled data only when it was made with this exact request.
+needCompile = ~exist('subjectData','var') || ~exist('stimData','var') || ...
+              ~exist('x','var') || ~exist('y','var') || ...
+              ~exist('compiledOpts','var') || ~isequaln(compiledOpts,compileRequest) || ...
+              ~iscell(stimData) || numel(stimData) ~= numel(subjectData);
+if needCompile
+    [subjectData,stimData,x,y] = compileStimAndSubData(compileRequest);
+    compiledOpts = compileRequest;
 end
+compileOpts = compileRequest;
+
 noiseSD = 0;
-
-
-dR = .2;
-radRangeList = [0:dR:2.4];
-
+dR = 0.2;
+radRangeList = 0:dR:4;
 radX = radRangeList(1:end-1)+dR/2;
-nRads = length(radRangeList)-1;
-imSize = [108,108];
-
-
-for i=1:10
-    figure(i)
-    clf
-end
-
+nRads = numel(radX);
 nSub = numel(subjectData);
-bestFill          = nan(nSub, nRads);
-demVal            = nan(nSub, nRads);
-tmpSlope_ff_only  = nan(nSub, nRads);
-fitOut            = cell(nSub, 1);
+if ~all(cellfun(@(S) isfield(S,'subNum'),subjectData))
+    error('VoxelDemingSlopeMapStuff:missingSubjectID','Each subject needs a subNum field.');
+end
+subjectIDs = cellfun(@(S) S.subNum,subjectData(:));
+sigmaFac = 1;                 % robustness check for assumed pRF size
+fillGrid = -0.1:0.05:1;
 
-opts = struct();
-opts.edgeNSigma         = 2;
-opts.combineRuns        = 'concat';
-opts.lambda             = 1;
-opts.forceZeroIntercept = true;
-opts.centerData         = true;
+simOpts = struct('rngSeed',1,'verbose',false,'fillMeasure','k');
+demingOpts = struct('lambda',1,'forceZeroIntercept',true, ...
+                    'centerData',true,'combineRuns','concat');
 
-simOpts = struct();
-simOpts.useVoxelGain = false;
-simOpts.rngSeed      = 1;
-simOpts.verbose      = false;
+bestFill = nan(nSub,nRads);
+rMean = nan(nSub,nRads);
+rExactMean = nan(nSub,nRads);
+nVoxUsed = zeros(nSub,nRads);
+atGridBoundary = false(nSub,nRads);
 
-demingOpts = struct();
-demingOpts.lambda             = 1;
-demingOpts.forceZeroIntercept = true;
-demingOpts.centerData         = true;
-demingOpts.combineRuns        = 'concat';
-demingOpts.verbose            = false;
-
-fillGrid = fliplr([-.1:.05:1]);
+for s = 1:nSub
+    figure(s); clf; hold on
+    xline(2,'--k','LineWidth',1.5);
+    xlabel('pRF eccentricity (deg)');
+    ylabel('Voxel Deming slope');
+    title(sprintf('Subject %d: measured and fitted slopes',s));
+    grid on; set(gca,'YLim',[-0.25,1.25],'XLim',[0,4],'XTick',radRangeList)
+end
 
 for radNum = 1:nRads
-
+    subsetOpts = compileOpts;
+    subsetOpts.radRange = radRangeList(radNum:radNum+1);
     for s = 1:nSub
-        fprintf('Subject %d of %d\n',s,nSub)
-        compileOpts.radRange = [radRangeList(radNum),radRangeList(radNum+1)];
-        subjectDataSub = subsetSubjectDataByVoxel(subjectData{s}, stimData, compileOpts);
-
-        % scale pRF sigmas by sigmaFac (single application)
-        subjectDataSub.sigma = subjectDataSub.sigma * sigmaFac;
-
-        % recompute G with the scaled sigmas
-        pRF = [];
-        G = zeros(size(subjectDataSub.Gprf));
-        for i = 1:length(subjectDataSub.sigma)
-            pRF.center = [subjectDataSub.prfXY(i,1), subjectDataSub.prfXY(i,2)];
-            pRF.sig    = subjectDataSub.sigma(i);
-            pRF.ar     = 1;
-            G(:,i)     = Gauss(pRF, x, y, 1);
+        fprintf('Bin %d/%d, subject %d/%d\n',radNum,nRads,s,nSub)
+        subjectDataSub = subsetSubjectDataByVoxel(subjectData{s},stimData{s},subsetOpts);
+        nVox = numel(subjectDataSub.sigma);
+        if nVox < 3
+            warning('VoxelDemingSlopeMapStuff:tooFewVoxels', ...
+                    'Skipping bin %d, subject %d: only %d voxels.',radNum,s,nVox);
+            continue
         end
 
-        % Normalize the pRFs to have equal area (not height).
-        G = G ./ repmat(sum(G), size(G,1), 1);
-        subjectDataSub.Gprf = G;
+        % Recalculate unit-area pRFs after applying the sigma robustness factor.
+        G = zeros(size(subjectDataSub.Gprf));
+        for v = 1:nVox
+            pRF.center = subjectDataSub.prfXY(v,:);
+            pRF.sig = subjectDataSub.sigma(v)*sigmaFac;
+            pRF.ar = 1;
+            G(:,v) = Gauss(pRF,x,y,1);
+        end
+        area = sum(G,1);
+        if any(~isfinite(G(:))) || any(~isfinite(area) | area <= 0)
+            error('VoxelDemingSlopeMapStuff:badGaussian', ...
+                  'Invalid pRF mass in bin %d, subject %d.',radNum,s);
+        end
+        subjectDataSub.Gprf = G./area;
 
-        fitOut{s} = fitFillFracFromResidualDeming(subjectDataSub, stimData, fillGrid, noiseSD, simOpts, demingOpts);
+        fo = fitFillFracFromDemingMap(subjectDataSub,stimData{s},fillGrid, ...
+                                      noiseSD,simOpts,demingOpts);
+        bestFill(s,radNum) = fo.bestFillFrac;
+        nVoxUsed(s,radNum) = nnz(fo.commonVoxels);
+        atGridBoundary(s,radNum) = ismember(fo.bestIndex,[1,numel(fillGrid)]);
+        q = isfinite(fo.r);
+        if any(q), rMean(s,radNum) = mean(fo.r(q)); end
+        q = isfinite(fo.rExact);
+        if any(q), rExactMean(s,radNum) = mean(fo.rExact(q)); end
 
-        % deming slope predicted by feedforward only
-        simData_ff_only = simulateSubjectDataWithFilling({subjectDataSub}, stimData, 0, 0, simOpts);
-        tmpSlope_ff_only(s, radNum) = mean(voxelDemingSlopeMap(simData_ff_only{1}, demingOpts), 'omitnan');
-
-        bestFill(s, radNum) = fitOut{s}.bestFillFrac;
-        demVal(s,   radNum) = mean(fitOut{s}.realSlope, 'omitnan');
-
-        fillFrac = bestFill(s, radNum);
-        simData     = simulateSubjectDataWithFilling({subjectDataSub}, stimData, noiseSD, fillFrac, simOpts);
-        simBetaVoxel = voxelDemingSlopeMap(simData{1}, demingOpts);
-
+        % Diagnostic overlay using the same options and model as the grid fit.
+        simData = simulateSubjectDataWithFilling({subjectDataSub},stimData(s), ...
+                                                  noiseSD,fo.bestFillFrac,simOpts);
+        measuredSlope = voxelDemingSlopeMap(subjectDataSub,demingOpts);
+        fittedSlope = voxelDemingSlopeMap(simData{1},demingOpts);
+        ecc = hypot(subjectDataSub.prfXY(:,1),subjectDataSub.prfXY(:,2));
         figure(s)
-        hold on
-        ecc = sqrt(subjectDataSub.prfXY(:,1).^2 + subjectDataSub.prfXY(:,2).^2);
-
-        plot(ecc, fitOut{s}.realSlope, 'wo', 'MarkerFaceColor','b', 'MarkerSize',3);
-        plot(ecc, simBetaVoxel,        'wo', 'MarkerFaceColor','r', 'MarkerSize',3, 'MarkerEdgeColor','none');
-
-        xline(2, '--k', 'LineWidth', 1.5);
-        xlabel('pRF eccentricity');
-        ylabel('Voxel Deming slope');
-        title('Voxel-wise Deming slopes vs eccentricity');
-        grid on;
-        set(gca,'YLim',[-.25,1.25])
-        set(gca,'XTick',radRangeList);
+        plot(ecc,measuredSlope,'o','MarkerFaceColor','b','MarkerEdgeColor','none','MarkerSize',3);
+        plot(ecc,fittedSlope,'o','MarkerFaceColor','r','MarkerEdgeColor','none','MarkerSize',3);
         drawnow
     end
-
-    % per-radNum aggregate plots
-    meanFill = mean(bestFill, 'omitnan');
-    semFill  = std(bestFill, 0, 'omitnan') ./ sqrt(sum(isfinite(bestFill)));
-    meanDem  = mean(demVal,   'omitnan');
-    semDem   = std(demVal,   0, 'omitnan') ./ sqrt(sum(isfinite(demVal)));
-
-    figure(11)
-    clf
-    hold on
-    for i = 1:nRads
-        plot(radX(i), bestFill(:,i), 'k.')
-    end
-    errorbar(radX, meanFill, semFill, 'k', 'LineStyle','none')
-    plot(radX, meanFill, 'ko-', 'MarkerFaceColor','b')
-    set(gca,'YLim',[-.1,1.1])
-    xlabel('Eccentricity (deg)')
-    ylabel('Filling In Factor (k)')
-    set(gca,'XLim',[0, max(radX)+.1]);
-
-    figure(12)
-    clf
-    hold on
-    for i = 1:nRads
-        plot(radX(i), demVal(:,i), 'k.')
-    end
-    errorbar(radX, meanDem, semDem, 'k', 'LineStyle','none')
-    plot(radX, meanDem, 'ko-', 'MarkerFaceColor','b')
-    set(gca,'YLim',[-.1,1.1])
-    xlabel('Eccentricity (deg)')
-    ylabel('Deming slope')
-    set(gca,'XLim',[0, max(radX)+.1]);
-    drawnow
 end
 
-fileName = sprintf('V%d_sigmaFac_%d',compileOpts.ROI,sigmaFac);
-save(fileName,"radX","bestFill","compileOpts","opts","simOpts","demingOpts")
+meanFill = mean(bestFill,1,'omitnan');
+semFill = std(bestFill,0,1,'omitnan')./sqrt(sum(isfinite(bestFill),1));
+meanR = mean(rMean,1,'omitnan');
+semR = std(rMean,0,1,'omitnan')./sqrt(sum(isfinite(rMean),1));
+meanRExact = mean(rExactMean,1,'omitnan');
+semRExact = std(rExactMean,0,1,'omitnan')./sqrt(sum(isfinite(rExactMean),1));
+figure(nSub+1); clf; hold on
+for radNum = 1:nRads
+    plot(radX(radNum),bestFill(:,radNum),'k.');
+end
+errorbar(radX,meanFill,semFill,'k','LineStyle','none');
+plot(radX,meanFill,'ko-','MarkerFaceColor','b');
+xline(2,'--k','LineWidth',1.5);
+xlabel('Eccentricity (deg)'); ylabel('Filling-in fraction (k)');
+set(gca,'YLim',[-0.1,1.1],'XLim',[0,max(radX)+0.1]); grid on
 
-fileName = sprintf('V%d_deming_%d',compileOpts.ROI,sigmaFac);
-save(fileName, 'meanDem','radX', 'semDem', 'meanFill', 'semFill','tmpSlope_ff_only');
-
-
-
+fileName = sprintf('V%d_sigmaFac_%g.mat',compileOpts.ROI,sigmaFac);
+save(fileName,'radX','radRangeList','bestFill','meanFill','semFill', ...
+              'rMean','meanR','semR','rExactMean','meanRExact','semRExact', ...
+              'nVoxUsed','atGridBoundary','fillGrid','sigmaFac', ...
+              'subjectIDs','compileOpts','simOpts','demingOpts')

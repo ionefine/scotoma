@@ -65,5 +65,10 @@ for h = 1:2
     hrfParams(h).a2    = double(T.a2(q));
     hrfParams(h).b1    = double(T.b1(q));
     hrfParams(h).b2    = double(T.b2(q));
+    values = struct2array(hrfParams(h));
+    if any(~isfinite(values))
+        error('loadHRFParams:nonfiniteParameters', ...
+              'Nonfinite HRF parameters for %s hemi-%s.',wanted,hemiOrder{h});
+    end
 end
 end

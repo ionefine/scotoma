@@ -1,8 +1,7 @@
 function [subjectDataSub,stimDataSub,keepIdx] = subsetSubjectDataByVoxel(subjectData,stimData,compileOpts)
 % subsetSubjectDataByVoxel  Select voxels while preserving subject metadata.
 %
-% Bins use (lower,upper], matching prfShiftFigure, so a voxel exactly on an
-% internal edge belongs to one bin rather than being dropped from both.
+% The radial filter includes both requested endpoints when edgeSigma is zero.
 
 requiredOpts = {'radRange','minvexpl','minSigma','edgeSigma'};
 if nargin < 3 || ~all(isfield(compileOpts,requiredOpts))
@@ -31,8 +30,8 @@ sigma = subjectData.sigma(:);
 ecc = hypot(subjectData.prfXY(:,1),subjectData.prfXY(:,2));
 lo = ecc-compileOpts.edgeSigma*sigma;
 hi = ecc+compileOpts.edgeSigma*sigma;
-keepIdx = lo > compileOpts.radRange(1) & hi <= compileOpts.radRange(2) & ...
-          w > compileOpts.minvexpl & sigma > compileOpts.minSigma & ...
+keepIdx = lo >= compileOpts.radRange(1) & hi <= compileOpts.radRange(2) & ...
+          w > compileOpts.minvexpl & sigma >= compileOpts.minSigma & ...
           isfinite(ecc) & isfinite(sigma) & isfinite(w);
 fprintf('keeping %d of %d voxels\n',nnz(keepIdx),nVox)
 
@@ -60,9 +59,15 @@ end
 if isfield(subjectData,'hemIdx')
     subjectDataSub.hemIdx = subjectData.hemIdx(keepIdx);
 end
+if isfield(subjectData,'sourceVoxelIndex')
+    subjectDataSub.sourceVoxelIndex = subjectData.sourceVoxelIndex(keepIdx);
+end
 if size(subjectData.Gprf,2) ~= nVox
     error('subsetSubjectDataByVoxel:badGprf','Gprf has the wrong voxel count.');
 end
 subjectDataSub.Gprf = subjectData.Gprf(:,keepIdx);
+if isfield(subjectDataSub,'selection')
+    subjectDataSub.selection.nEligibleVoxels = nnz(keepIdx);
+end
 stimDataSub = stimData;
 end

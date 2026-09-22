@@ -1,4 +1,4 @@
-function T = fitFixedKByEcc(subjectData,stimData,eccEdges,nBoot,opts)
+function T = fitFixedKByEcc(subjectData,stimData,eccEdges,opts)
 % fitFixedKByEcc  Fast fixed-pRF estimates of k and k2 by eccentricity.
 %
 % This computes only the fixed-pRF coefficients. It uses the Gprf matrices
@@ -9,19 +9,15 @@ function T = fitFixedKByEcc(subjectData,stimData,eccEdges,nBoot,opts)
 % INPUTS
 %   subjectData, stimData  cell arrays from compileStimAndSubData
 %   eccEdges               eccentricity bin edges
-%   nBoot                  subject bootstrap replicates (default 2000)
-%   opts.alpha             interval alpha             (default 0.05)
-%       .minEcc            minimum pRF eccentricity   (default 0.1)
+%   opts.minEcc            minimum pRF eccentricity   (default 0)
 %       .minVox            minimum voxels per bin     (default 20)
 %
 % OUTPUT
 %   T  one row per eccentricity bin, directly usable by
 %      plotKResponseDecomposition
 
-if nargin < 4 || isempty(nBoot), nBoot = 2000; end
-if nargin < 5 || isempty(opts), opts = struct(); end
-if ~isfield(opts,'alpha'), opts.alpha = 0.05; end
-if ~isfield(opts,'minEcc'), opts.minEcc = 0.1; end
+if nargin < 4 || isempty(opts), opts = struct(); end
+if ~isfield(opts,'minEcc'), opts.minEcc = 0; end
 if ~isfield(opts,'minVox'), opts.minVox = 20; end
 if ~iscell(subjectData), subjectData = {subjectData}; end
 if ~iscell(stimData) || numel(stimData) ~= numel(subjectData)
@@ -32,19 +28,15 @@ eccEdges = double(eccEdges(:).');
 if numel(eccEdges) < 2 || any(~isfinite(eccEdges)) || any(diff(eccEdges) <= 0)
     error('fitFixedKByEcc:badEdges','eccEdges must increase strictly.');
 end
-if ~isscalar(nBoot) || nBoot < 0 || nBoot ~= round(nBoot)
-    error('fitFixedKByEcc:badBootstrap','nBoot must be a nonnegative integer.');
-end
-if ~isscalar(opts.alpha) || opts.alpha <= 0 || opts.alpha >= 1 || ...
-   ~isscalar(opts.minEcc) || ~isfinite(opts.minEcc) || opts.minEcc < 0 || ...
+if ~isscalar(opts.minEcc) || ~isfinite(opts.minEcc) || opts.minEcc < 0 || ...
    ~isscalar(opts.minVox) || opts.minVox < 1 || opts.minVox ~= round(opts.minVox)
-    error('fitFixedKByEcc:badOptions','alpha, minEcc, or minVox is invalid.');
+    error('fitFixedKByEcc:badOptions','minEcc or minVox is invalid.');
 end
 
 nSub = numel(subjectData);
 nBin = numel(eccEdges)-1;
-[Ak,ck,zzk,dfk,Ak2,ck2,zzk2,dfk2,nVox] = deal(zeros(nSub,nBin));
-massByBin = cell(nBin,1);
+[Ak,ck,Ak2,ck2,nVox] = deal(zeros(nSub,nBin));
+massBySubject = nan(nSub,nBin);
 
 for s = 1:nSub
     S = subjectData{s}; D = stimData{s};
@@ -103,20 +95,19 @@ for s = 1:nSub
         F{r} = centre(convByHemisphere(Sf*G,hrf,D.TR,hemIdx,r));
         P{r} = centre(convByHemisphere(Ss*G,hrf,D.TR,hemIdx,r));
         Yf = centre(double(S.Yfull{r}));
-        Ys = centre(double(S.Yscot{r}));
-        good0{r} = isfinite(F{r}) & isfinite(P{r}) & ...
-                   isfinite(Yf) & isfinite(Ys);
+        good0{r} = isfinite(F{r}) & isfinite(P{r});
+        goodFull = isfinite(F{r}) & isfinite(Yf);
         Fr = F{r}; Yr = Yf;
-        Fr(~good0{r}) = 0; Yr(~good0{r}) = 0;
+        Fr(~goodFull) = 0; Yr(~goodFull) = 0;
         num = num+sum(Fr.*Yr,1);
         den = den+sum(Fr.^2,1);
-        nGood = nGood+sum(good0{r},1);
+        nGood = nGood+sum(goodFull,1);
     end
     beta = num./den;
     beta(~isfinite(beta) | beta <= 0 | den <= eps | nGood < 20) = NaN;
 
-    a = zeros(1,n); c = zeros(1,n); zz = zeros(1,n); ng = zeros(1,n);
-    a2 = zeros(1,n); c2 = zeros(1,n); zz2 = zeros(1,n); ng2 = zeros(1,n);
+    a = zeros(1,n); c = zeros(1,n); ng = zeros(1,n);
+    a2 = zeros(1,n); c2 = zeros(1,n); ng2 = zeros(1,n);
     for r = 1:nRun
         Ys = centre(double(S.Yscot{r}));
         Z = Ys-P{r}.*beta;
@@ -126,8 +117,8 @@ for s = 1:nSub
         good2 = good0{r} & isfinite(Z) & isfinite(W2);
         Zk = Z; Wk = W; Zk(~good) = 0; Wk(~good) = 0;
         Z2 = Z; Wf = W2; Z2(~good2) = 0; Wf(~good2) = 0;
-        a = a+sum(Wk.^2,1); c = c+sum(Wk.*Zk,1); zz = zz+sum(Zk.^2,1);
-        a2 = a2+sum(Wf.^2,1); c2 = c2+sum(Wf.*Z2,1); zz2 = zz2+sum(Z2.^2,1);
+        a = a+sum(Wk.^2,1); c = c+sum(Wk.*Zk,1);
+        a2 = a2+sum(Wf.^2,1); c2 = c2+sum(Wf.*Z2,1);
         ng = ng+sum(good,1); ng2 = ng2+sum(good2,1);
     end
     ok = isfinite(beta) & a > eps & a2 > eps & ng >= 20 & ng2 >= 20 & ...
@@ -137,61 +128,32 @@ for s = 1:nSub
     for b = 1:nBin
         q = ok(:) & bin(:) == b;
         if ~any(q), continue, end
-        Ak(s,b) = sum(a(q)); ck(s,b) = sum(c(q)); zzk(s,b) = sum(zz(q));
-        Ak2(s,b) = sum(a2(q)); ck2(s,b) = sum(c2(q)); zzk2(s,b) = sum(zz2(q));
-        dfk(s,b) = sum(max(ng(q)-nRun,1));
-        dfk2(s,b) = sum(max(ng2(q)-nRun,1));
+        Ak(s,b) = sum(a(q)); ck(s,b) = sum(c(q));
+        Ak2(s,b) = sum(a2(q)); ck2(s,b) = sum(c2(q));
         nVox(s,b) = nnz(q);
-        massByBin{b} = [massByBin{b};mass(q).']; %#ok<AGROW>
+        massBySubject(s,b) = median(mass(q),'omitnan');
     end
     fprintf('fixed-pRF fit: subject %d/%d\n',s,nSub);
 end
 
 ecc = ((eccEdges(1:end-1)+eccEdges(2:end))/2).';
-[k,kLo,kHi,nTotal] = poolScalar(Ak,ck,zzk,dfk,nVox,nBoot,opts.alpha,opts.minVox);
-[k2,k2Lo,k2Hi] = poolScalar(Ak2,ck2,zzk2,dfk2,nVox,nBoot,opts.alpha,opts.minVox);
-massMedian = nan(nBin,1); massRMS = nan(nBin,1);
-for b = 1:nBin
-    if ~isempty(massByBin{b})
-        massMedian(b) = median(massByBin{b});
-        massRMS(b) = sqrt(mean(massByBin{b}.^2));
-    end
-end
-nSubjects = sum(nVox > 0,1).';
-T = table(ecc,massMedian,massRMS,nTotal,nSubjects,k,kLo,kHi,k2,k2Lo,k2Hi, ...
-    'VariableNames',{'ecc','massIn_median','massIn_rms','nVox_fixedPRF', ...
-                     'nSubjects','k','k_lo','k_hi','k2','k2_lo','k2_hi'});
-end
-
-function [b,lo,hi,nTotal] = poolScalar(A,c,zz,dof,nVox,nBoot,alpha,minVox)
-nBin = size(A,2); nSub = size(A,1);
-[b,lo,hi] = deal(nan(nBin,1));
-nTotal = sum(nVox,1).';
-for j = 1:nBin
-    aa = sum(A(:,j)); cc = sum(c(:,j));
-    if aa <= eps || nTotal(j) < minVox, continue, end
-    b(j) = cc/aa;
-    if nBoot > 0 && nSub >= 3
-        idx = randi(nSub,nSub,nBoot);
-        ab = sum(reshape(A(idx,j),nSub,nBoot),1);
-        cb = sum(reshape(c(idx,j),nSub,nBoot),1);
-        bs = cb./ab;
-        lo(j) = percentile(bs,alpha/2);
-        hi(j) = percentile(bs,1-alpha/2);
-    else
-        sse = max(sum(zz(:,j))-b(j)*cc,0);
-        se = sqrt((sse/max(sum(dof(:,j))-1,1))/aa);
-        z = sqrt(2)*erfinv(1-alpha);
-        lo(j) = b(j)-z*se; hi(j) = b(j)+z*se;
-    end
-end
+kBySubject = ck./Ak; k2BySubject = ck2./Ak2;
+kBySubject(Ak <= eps | nVox < opts.minVox) = NaN;
+k2BySubject(Ak2 <= eps | nVox < opts.minVox) = NaN;
+[k,kSE] = columnMeanSE(kBySubject); [k2,k2SE] = columnMeanSE(k2BySubject);
+[massMedian,massMedianSE] = columnMeanSE(massBySubject);
+nSubjects = sum(isfinite(kBySubject) & isfinite(k2BySubject),1).';
+nTotal = sum(nVox.*(isfinite(kBySubject) & isfinite(k2BySubject)),1).';
+T = table(ecc,massMedian,massMedianSE,nTotal,nSubjects,k,kSE,k2,k2SE, ...
+    'VariableNames',{'ecc','massIn_median','massIn_median_se','nVox_fixedPRF', ...
+                     'nSubjects','k','k_se','k2','k2_se'});
+T.Properties.UserData.kBySubject = kBySubject;
+T.Properties.UserData.k2BySubject = k2BySubject;
 end
 
-function v = percentile(z,p)
-z = sort(z(isfinite(z)));
-if isempty(z), v = NaN; return, end
-i = max(1,min(numel(z),ceil(p*numel(z))));
-v = z(i);
+function [m,se] = columnMeanSE(X)
+m = mean(X,1,'omitnan').'; n = sum(isfinite(X),1).';
+se = std(X,0,1,'omitnan').'./sqrt(n); se(n < 2) = NaN;
 end
 
 function Z = centre(Z)

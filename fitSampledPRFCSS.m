@@ -1,26 +1,11 @@
 function out = fitSampledPRFCSS(subjectData,stimData,x,y,roi,opts)
-% fitSampledPRFCSS  Refit sampled voxels with linear and CSS pRF models.
+% fitSampledPRFCSS  Fit linear and CSS pRFs with independent locations.
 %
-% Both pRF models are fitted only to the three independent mapping runs
-% stored in Yprf. Their fitted geometry is then held fixed. Beta is
-% re-estimated from the separate three full-field comparison runs, and k is
-% fitted to the three scotoma runs. The same voxels are used throughout.
-%
-% The CSS model is
-%   neural(t) = (stimulus(t)*G(x0,y0,sigma))^n
-% followed by HRF convolution. The scotoma model replaces stimulus with
-%   Sscot + k*(Sfull-Sscot).
-%
-% Voxel handling:
-%   * compileStimAndSubData applies the original-pRF inclusion criteria.
-%   * Both mapping models must fit successfully before a voxel contributes
-%     to the direct linear-versus-CSS k comparison.
-%   * CSS n diagnostics use successful CSS mapping fits and therefore do
-%     not depend on the separate full/scotoma comparison runs.
-%   * Bounds are flagged in the output, not silently discarded.
-%
-% Required external functions: loadScotomaStimuli, hrf_twogamma, and
-% fminsearchcon (included in pRF-master/matlab/externals).
+% Independent study-1 pRF files supply x and y. The three current full-field
+% runs estimate sigma and beta for the linear model (n=1), and sigma, n, and
+% beta for the CSS model. Those parameters are then held fixed while k is
+% fitted only to the three scotoma runs. Group error bars are standard errors
+% across subject-level estimates; voxels are never treated as subjects.
 
 if nargin < 6 || isempty(opts), opts = struct(); end
 opts = defaults(opts);
@@ -29,359 +14,248 @@ if ~iscell(stimData) || numel(stimData) ~= numel(subjectData)
     error('fitSampledPRFCSS:subjectCount','stimData must contain one entry per subject.');
 end
 if exist('fminsearchcon','file') ~= 2
-    error('fitSampledPRFCSS:missingOptimizer', ...
-          'Add pRF-master and its subfolders to the MATLAB path so fminsearchcon is available.');
+    error('fitSampledPRFCSS:missingOptimizer','fminsearchcon must be on the MATLAB path.');
 end
 validateattributes(x,{'numeric'},{'real','finite','nonempty'},mfilename,'x');
 validateattributes(y,{'numeric'},{'real','finite','size',size(x)},mfilename,'y');
-validateattributes(roi,{'numeric'},{'real','finite','scalar','integer','>=',1},mfilename,'roi');
-nSub = numel(subjectData);
-nRun = numel(subjectData{1}.Yfull);
-[Afull,Ascot,stimTime] = loadRawStimuli(nRun,opts.TR,x,y);
-oldRng = rng;
-cleanupRng = onCleanup(@() rng(oldRng)); %#ok<NASGU>
-rng(opts.rngSeed+1000*roi);
-nBin = numel(opts.eccEdges)-1;
-kLinearBySubject = nan(nSub,nBin);
-kCSSBySubject = nan(nSub,nBin);
-nVoxBySubject = zeros(nSub,nBin);
-medianNBySubject = nan(nSub,nBin);
+validateattributes(roi,{'numeric'},{'scalar','integer','positive','finite'},mfilename,'roi');
+nSub = numel(subjectData); nBin = numel(opts.eccEdges)-1;
+kLinearBySubject = nan(nSub,nBin); kCSSBySubject = nan(nSub,nBin);
+kLinearAtBoundary = false(nSub,nBin); kCSSAtBoundary = false(nSub,nBin);
+nVoxBySubject = zeros(nSub,nBin); medianNBySubject = nan(nSub,nBin);
 medianLinearSigmaBySubject = nan(nSub,nBin);
 medianCssEffectiveSigmaBySubject = nan(nSub,nBin);
 voxelTables = cell(nSub,1);
+oldRng = rng; cleanupRng = onCleanup(@() rng(oldRng)); %#ok<NASGU>
+rng(opts.rngSeed+1000*roi);
 for s = 1:nSub
     S = subjectData{s}; D = stimData{s};
-    required = {'Yprf','Yfull','Yscot','prfXY','sigma','w_vox','hemIdx'};
-    if ~isstruct(S) || ~all(isfield(S,required)) || ~isstruct(D) || ...
-            ~all(isfield(D,{'hrfParams','Aprf','tPrf'}))
-        error('fitSampledPRFCSS:badSubject','Subject %d is incomplete.',s);
-    end
-    if numel(D.hrfParams) < 1 || numel(D.hrfParams) > 2
-        error('fitSampledPRFCSS:badHRF', ...
-              'stimData{%d}.hrfParams must hold one struct per hemisphere.',s);
-    end
-    if any(double(S.hemIdx(:)) < 1 | double(S.hemIdx(:)) > numel(D.hrfParams))
-        error('fitSampledPRFCSS:badHemIdx', ...
-              'hemIdx for subject %d indexes outside hrfParams.',s);
-    end
-    if numel(S.Yprf) ~= nRun || numel(S.Yfull) ~= nRun || numel(S.Yscot) ~= nRun
-        error('fitSampledPRFCSS:runCount','Run counts disagree for subject %d.',s);
-    end
-    nAll = size(S.prfXY,1);
-    if numel(S.sigma) ~= nAll || numel(S.w_vox) ~= nAll || numel(S.hemIdx) ~= nAll
-        error('fitSampledPRFCSS:voxelCount','pRF fields disagree for subject %d.',s);
-    end
-    for r = 1:nRun
-        if size(S.Yprf{r},2) ~= nAll || size(S.Yfull{r},2) ~= nAll || ...
-                ~isequal(size(S.Yfull{r}),size(S.Yscot{r})) || ...
-                size(S.Yprf{r},1) ~= size(D.Aprf{r},1)
-            error('fitSampledPRFCSS:dataSize','BOLD dimensions disagree for subject %d.',s);
-        end
-    end
+    validateSubject(S,D,x,y,s);
+    nRun = numel(S.Yfull);
     eccAll = hypot(S.prfXY(:,1),S.prfXY(:,2));
     binAll = discretize(eccAll,opts.eccEdges);
-    sampled = [];
-    sampledBin = [];
-    for b = 1:nBin
-        candidates = find(binAll == b);
-        if numel(candidates) > opts.nPerBin
-            candidates = candidates(randperm(numel(candidates),opts.nPerBin));
-        end
-        sampled = [sampled;candidates(:)]; %#ok<AGROW>
-        sampledBin = [sampledBin;repmat(b,numel(candidates),1)]; %#ok<AGROW>
-    end
+    sampled = sampleByBin(binAll,nBin,opts.nPerBin);
     if isempty(sampled)
-        warning('fitSampledPRFCSS:noVoxels','Subject %d has no voxels in the requested bins.',s);
-        voxelTables{s} = table();
-        continue
+        warning('fitSampledPRFCSS:noVoxels','Subject %d has no voxels in range.',s);
+        voxelTables{s} = table(); continue
     end
-    % One HRF per hemisphere, so hrf{h}{r} and hrfPrf{h}{r}. hemIdx selects
-    % the row of D.hrfParams that belongs to each sampled voxel.
-    nHem = numel(D.hrfParams);
-    hrf = cell(nHem,1);
-    hrfPrf = cell(nHem,1);
-    Yprf = cell(nRun,1);
-    Yfull = cell(nRun,1);
-    Yscot = cell(nRun,1);
-    for h = 1:nHem
-        hrf{h} = cell(nRun,1);
-        hrfPrf{h} = cell(nRun,1);
-        for r = 1:nRun
-            hrf{h}{r} = double(hrf_twogamma(D.hrfParams(h),stimTime{r}));
-            hrf{h}{r} = hrf{h}{r}(:);
-            hrfPrf{h}{r} = double(hrf_twogamma(D.hrfParams(h),D.tPrf{r}));
-            hrfPrf{h}{r} = hrfPrf{h}{r}(:);
-        end
-    end
-    for r = 1:nRun
-        Yprf{r} = centre(double(S.Yprf{r}(:,sampled)));
-        Yfull{r} = centre(double(S.Yfull{r}(:,sampled)));
-        Yscot{r} = centre(double(S.Yscot{r}(:,sampled)));
-    end
-    hemIdx = double(S.hemIdx(sampled));
-    hemIdx = hemIdx(:);
-    nSample = numel(sampled);
-    pLinear = nan(nSample,3); betaLinear = nan(nSample,1);
-    sseLinear = nan(nSample,1); r2Linear = nan(nSample,1); corrLinear = nan(nSample,1);
-    pCSS = nan(nSample,4); betaCSS = nan(nSample,1);
-    sseCSS = nan(nSample,1); r2CSS = nan(nSample,1); corrCSS = nan(nSample,1);
-    p0 = [double(S.prfXY(sampled,:)),double(S.sigma(sampled))];
-    fitArgs = struct('Afull',{D.Aprf},'hrf',{hrfPrf},'TR',opts.TR,'x',double(x), ...
-                     'y',double(y),'centreLimit',opts.centreLimit, ...
-                     'sigmaBounds',opts.sigmaBounds,'nBounds',opts.nBounds, ...
-                     'cssStarts',opts.cssStarts,'optim',opts.optim);
+    sampledBin = binAll(sampled); nSample = numel(sampled);
+    Yfull = selectColumns(S.Yfull,sampled); Yscot = selectColumns(S.Yscot,sampled);
+    xy = double(S.prfXY(sampled,:)); hemIdx = double(S.hemIdx(sampled));
+    hrf = makeHRFs(D,nRun);
+    args = struct('Afull',{D.SfullRaw},'hrf',{hrf},'TR',D.TR,'x',double(x), ...
+        'y',double(y),'sigmaBounds',opts.sigmaBounds,'nBounds',opts.nBounds, ...
+        'nStarts',opts.cssStarts,'optim',opts.optim);
+    [linearSigma,linearBeta,linearSSE,linearR2,linearCorr,linearExitflag, ...
+     cssSigma,cssN,cssBeta,cssSSE,cssR2,cssCorr,cssExitflag] = deal(nan(nSample,1));
     useParfor = opts.useParallel && license('test','Distrib_Computing_Toolbox');
     if useParfor
         parfor v = 1:nSample
-            yv = selectVoxel(Yprf,v);
-            [pLinear(v,:),betaLinear(v),sseLinear(v),r2Linear(v),corrLinear(v), ...
-             pCSS(v,:),betaCSS(v),sseCSS(v),r2CSS(v),corrCSS(v)] = ...
-                fitVoxelModels(yv,p0(v,:),fitArgs,hemIdx(v));
+            yv = selectVoxel(Yfull,v);
+            [linearSigma(v),linearBeta(v),linearSSE(v),linearR2(v),linearCorr(v), ...
+             linearExitflag(v),cssSigma(v),cssN(v),cssBeta(v),cssSSE(v),cssR2(v), ...
+             cssCorr(v),cssExitflag(v)] = fitVoxel(yv,xy(v,:), ...
+                double(S.sigma(sampled(v))),args,hemIdx(v));
         end
     else
         for v = 1:nSample
-            yv = selectVoxel(Yprf,v);
-            [pLinear(v,:),betaLinear(v),sseLinear(v),r2Linear(v),corrLinear(v), ...
-             pCSS(v,:),betaCSS(v),sseCSS(v),r2CSS(v),corrCSS(v)] = ...
-                fitVoxelModels(yv,p0(v,:),fitArgs,hemIdx(v));
-            if opts.verbose && (mod(v,10) == 0 || v == nSample)
-                fprintf('V%d subject %d/%d: fitted %d/%d sampled voxels\n', ...
-                        roi,s,nSub,v,nSample);
+            yv = selectVoxel(Yfull,v);
+            [linearSigma(v),linearBeta(v),linearSSE(v),linearR2(v),linearCorr(v), ...
+             linearExitflag(v),cssSigma(v),cssN(v),cssBeta(v),cssSSE(v),cssR2(v), ...
+             cssCorr(v),cssExitflag(v)] = fitVoxel(yv,xy(v,:), ...
+                double(S.sigma(sampled(v))),args,hemIdx(v));
+            if opts.verbose && (mod(v,25) == 0 || v == nSample)
+                fprintf('V%d subject %d/%d: fitted %d/%d voxels\n',roi,s,nSub,v,nSample);
             end
         end
     end
-    mappingBetaLinear = betaLinear;
-    mappingBetaCSS = betaCSS;
-    betaLinear = refitBeta(pLinear,ones(nSample,1),Yfull,Afull,hrf,x,y,opts.TR,hemIdx);
-    betaCSS = refitBeta(pCSS(:,1:3),pCSS(:,4),Yfull,Afull,hrf,x,y,opts.TR,hemIdx);
-    validLinearPRF = all(isfinite(pLinear),2) & isfinite(mappingBetaLinear) & ...
-                     mappingBetaLinear > 0 & isfinite(r2Linear) & ...
-                     r2Linear >= opts.minMappingR2;
-    validCSSPRF = all(isfinite(pCSS),2) & isfinite(mappingBetaCSS) & ...
-                  mappingBetaCSS > 0 & isfinite(r2CSS) & ...
-                  r2CSS >= opts.minMappingR2;
-    validForK = validLinearPRF & validCSSPRF & ...
-                isfinite(betaLinear) & betaLinear > 0 & ...
-                isfinite(betaCSS) & betaCSS > 0;
-    cssEffectiveSigma = pCSS(:,3)./sqrt(pCSS(:,4));
+    validLinear = isfinite(linearSigma) & linearSigma > 0 & isfinite(linearBeta) & ...
+        linearBeta > 0 & isfinite(linearR2) & linearR2 >= opts.minFullR2 & linearExitflag > 0;
+    validCSS = isfinite(cssSigma) & cssSigma > 0 & isfinite(cssN) & ...
+        isfinite(cssBeta) & cssBeta > 0 & isfinite(cssR2) & ...
+        cssR2 >= opts.minFullR2 & cssExitflag > 0;
+    validForK = validLinear & validCSS;
+    cssEffectiveSigma = cssSigma./sqrt(cssN);
+    linearSigmaAtBoundary = atBounds(linearSigma,opts.sigmaBounds,opts.boundaryTol);
+    cssSigmaAtBoundary = atBounds(cssSigma,opts.sigmaBounds,opts.boundaryTol);
+    cssNAtBoundary = atBounds(cssN,opts.nBounds,opts.boundaryTol);
     for b = 1:nBin
         q = sampledBin == b & validForK;
         nVoxBySubject(s,b) = nnz(q);
-        if nnz(q) < opts.minVoxPerBin, continue, end
-        kLinearBySubject(s,b) = fitK(pLinear(q,:),ones(nnz(q),1),betaLinear(q), ...
-                                      selectVoxels(Yscot,q),Afull,Ascot,hrf,x,y,opts,hemIdx(q));
-        kCSSBySubject(s,b) = fitK(pCSS(q,1:3),pCSS(q,4),betaCSS(q), ...
-                                  selectVoxels(Yscot,q),Afull,Ascot,hrf,x,y,opts,hemIdx(q));
-    end
-    for b = 1:nBin
-        qCss = sampledBin == b & validCSSPRF;
-        qBoth = sampledBin == b & validLinearPRF & validCSSPRF;
+        if nnz(q) >= opts.minVoxPerBin
+            [kLinearBySubject(s,b),kLinearAtBoundary(s,b)] = fitK(xy(q,:), ...
+                linearSigma(q),ones(nnz(q),1),linearBeta(q),selectVoxels(Yscot,q), ...
+                D,hrf,x,y,hemIdx(q),opts);
+            [kCSSBySubject(s,b),kCSSAtBoundary(s,b)] = fitK(xy(q,:),cssSigma(q), ...
+                cssN(q),cssBeta(q),selectVoxels(Yscot,q),D,hrf,x,y,hemIdx(q),opts);
+        end
+        qCss = sampledBin == b & validCSS;
         if nnz(qCss) >= opts.minVoxPerBin
-            medianNBySubject(s,b) = median(pCSS(qCss,4),'omitnan');
+            medianNBySubject(s,b) = median(cssN(qCss),'omitnan');
         end
-        if nnz(qBoth) >= opts.minVoxPerBin
-            medianLinearSigmaBySubject(s,b) = median(pLinear(qBoth,3),'omitnan');
-            medianCssEffectiveSigmaBySubject(s,b) = median(cssEffectiveSigma(qBoth),'omitnan');
+        if nnz(q) >= opts.minVoxPerBin
+            medianLinearSigmaBySubject(s,b) = median(linearSigma(q),'omitnan');
+            medianCssEffectiveSigmaBySubject(s,b) = median(cssEffectiveSigma(q),'omitnan');
         end
     end
-    subNum = s;
-    if isfield(S,'subNum'), subNum = S.subNum; end
-    nAtBoundary = abs(pCSS(:,4)-opts.nBounds(1)) <= opts.boundaryTol | ...
-                  abs(pCSS(:,4)-opts.nBounds(2)) <= opts.boundaryTol;
-    % MATLAB preserves the orientation of some indexed vectors. In
-    % particular, w_vox is often stored as 1-by-n, which previously made
-    % that table variable a row while every other variable had nSample
-    % rows. Force every scalar-per-voxel field to an nSample-by-1 column.
-    subColumn = repmat(subNum,nSample,1);
-    roiColumn = repmat(roi,nSample,1);
-    voxelIndex = reshape(sampled,[],1);
-    if isfield(S,'sourceVoxelIndex')
-        sourceVoxelIndex = reshape(S.sourceVoxelIndex(sampled),[],1);
-    else
-        sourceVoxelIndex = voxelIndex;
-    end
-    eccBin = reshape(sampledBin,[],1);
-    originalEcc = reshape(eccAll(sampled),[],1);
-    originalX = reshape(double(S.prfXY(sampled,1)),[],1);
-    originalY = reshape(double(S.prfXY(sampled,2)),[],1);
-    originalSigma = reshape(double(S.sigma(sampled)),[],1);
-    originalVexpl = reshape(double(S.w_vox(sampled)),[],1);
-    voxelTables{s} = table(subColumn,roiColumn,voxelIndex,sourceVoxelIndex,eccBin,originalEcc, ...
-        originalX,originalY,originalSigma,originalVexpl, ...
-        pLinear(:,1),pLinear(:,2),pLinear(:,3),mappingBetaLinear,betaLinear, ...
-        sseLinear,r2Linear,corrLinear,validLinearPRF, ...
-        pCSS(:,1),pCSS(:,2),pCSS(:,3),pCSS(:,4),cssEffectiveSigma, ...
-        mappingBetaCSS,betaCSS,sseCSS,r2CSS,corrCSS,validCSSPRF,validForK,nAtBoundary, ...
-        'VariableNames',{'subNum','ROI','voxelIndex','sourceVoxelIndex','eccBin','originalEcc', ...
-        'originalX','originalY','originalSigma','originalVexpl', ...
-        'linearX','linearY','linearSigma','linearMappingBeta','linearBeta', ...
-        'linearSSE','linearR2','linearCorr','validLinearPRF', ...
-        'cssX','cssY','cssSigma','cssN','cssEffectiveSigma','cssMappingBeta', ...
-        'cssBeta','cssSSE','cssR2','cssCorr','validCSSPRF','validForK','cssNAtBoundary'});
-    if opts.verbose
-        fprintf('V%d subject %d/%d complete: %d/%d fits usable for k\n', ...
-                roi,s,nSub,nnz(validForK),nSample);
-    end
+    subNum = s; if isfield(S,'subNum'), subNum = S.subNum; end
+    sourceVoxelIndex = sampled;
+    if isfield(S,'sourceVoxelIndex'), sourceVoxelIndex = S.sourceVoxelIndex(sampled); end
+    voxelTables{s} = table(repmat(subNum,nSample,1),repmat(roi,nSample,1), ...
+        reshape(sampled,[],1),reshape(sourceVoxelIndex,[],1),reshape(sampledBin,[],1), ...
+        reshape(eccAll(sampled),[],1),xy(:,1),xy(:,2),reshape(double(S.sigma(sampled)),[],1), ...
+        reshape(double(S.w_vox(sampled)),[],1),linearSigma,linearBeta,linearSSE,linearR2, ...
+        linearCorr,linearExitflag,validLinear,linearSigmaAtBoundary,cssSigma,cssN, ...
+        cssEffectiveSigma,cssBeta,cssSSE,cssR2,cssCorr,cssExitflag,validCSS, ...
+        cssSigmaAtBoundary,cssNAtBoundary,validForK, ...
+        'VariableNames',{'subNum','ROI','voxelIndex','sourceVoxelIndex','eccBin', ...
+        'originalEcc','independentX','independentY','originalSigma','originalVexpl', ...
+        'linearSigma','linearBeta','linearSSE','linearR2','linearCorr','linearExitflag', ...
+        'validLinearPRF','linearSigmaAtBoundary','cssSigma','cssN','cssEffectiveSigma', ...
+        'cssBeta','cssSSE','cssR2','cssCorr','cssExitflag','validCSSPRF', ...
+        'cssSigmaAtBoundary','cssNAtBoundary','validForK'});
 end
-hasVariables = cellfun(@(T) istable(T) && width(T) > 0,voxelTables);
-if any(hasVariables)
-    voxelTable = vertcat(voxelTables{hasVariables});
-else
-    voxelTable = table();
-end
-summaryTable = summarizeResults(kLinearBySubject,kCSSBySubject,nVoxBySubject, ...
-    medianNBySubject,medianLinearSigmaBySubject, ...
-    medianCssEffectiveSigmaBySubject,roi,opts);
-out = struct();
-out.ROI = roi;
-out.options = opts;
-out.voxelTable = voxelTable;
-out.summaryTable = summaryTable;
-out.kLinearBySubject = kLinearBySubject;
-out.kCSSBySubject = kCSSBySubject;
-out.nVoxBySubject = nVoxBySubject;
-out.medianNBySubject = medianNBySubject;
-out.medianLinearSigmaBySubject = medianLinearSigmaBySubject;
-out.medianCssEffectiveSigmaBySubject = medianCssEffectiveSigmaBySubject;
+hasRows = cellfun(@(T) istable(T) && height(T) > 0,voxelTables);
+if any(hasRows), voxelTable = vertcat(voxelTables{hasRows}); else, voxelTable = table(); end
+summaryTable = summarize(kLinearBySubject,kCSSBySubject,nVoxBySubject, ...
+    medianNBySubject,medianLinearSigmaBySubject,medianCssEffectiveSigmaBySubject, ...
+    kLinearAtBoundary,kCSSAtBoundary,roi,opts);
+out = struct('ROI',roi,'options',opts,'voxelTable',voxelTable,'summaryTable',summaryTable, ...
+    'kLinearBySubject',kLinearBySubject,'kCSSBySubject',kCSSBySubject, ...
+    'kLinearAtBoundary',kLinearAtBoundary,'kCSSAtBoundary',kCSSAtBoundary, ...
+    'nVoxBySubject',nVoxBySubject,'medianNBySubject',medianNBySubject, ...
+    'medianLinearSigmaBySubject',medianLinearSigmaBySubject, ...
+    'medianCssEffectiveSigmaBySubject',medianCssEffectiveSigmaBySubject);
 end
 
 function opts = defaults(opts)
-if ~isfield(opts,'TR'), opts.TR = 1.2; end
-if ~isfield(opts,'eccEdges'), opts.eccEdges = 0:0.25:8; end
-if ~isfield(opts,'nPerBin'), opts.nPerBin = 10; end
+if ~isfield(opts,'eccEdges'), opts.eccEdges = 0:0.25:5; end
+if ~isfield(opts,'nPerBin'), opts.nPerBin = Inf; end
 if ~isfield(opts,'minVoxPerBin'), opts.minVoxPerBin = 5; end
 if ~isfield(opts,'rngSeed'), opts.rngSeed = 1; end
-if ~isfield(opts,'centreLimit'), opts.centreLimit = 8.5; end
 if ~isfield(opts,'sigmaBounds'), opts.sigmaBounds = [0.05 8]; end
 if ~isfield(opts,'nBounds'), opts.nBounds = [0.05 1.35]; end
-if ~isfield(opts,'cssStarts'), opts.cssStarts = [0.12 0.33 0.75 1.15]; end
-if ~isfield(opts,'minMappingR2')
-    if isfield(opts,'minFullR2')
-        opts.minMappingR2 = opts.minFullR2; % compatibility with older scripts
-    else
-        opts.minMappingR2 = 0;
-    end
-end
+if ~isfield(opts,'cssStarts'), opts.cssStarts = [0.12 0.33 0.75 1 1.2]; end
+if ~isfield(opts,'minFullR2'), opts.minFullR2 = -Inf; end
 if ~isfield(opts,'kBounds'), opts.kBounds = [0 1]; end
 if ~isfield(opts,'kGridStep'), opts.kGridStep = 0.05; end
 if ~isfield(opts,'boundaryTol'), opts.boundaryTol = 0.01; end
 if ~isfield(opts,'useParallel'), opts.useParallel = true; end
 if ~isfield(opts,'verbose'), opts.verbose = true; end
 if ~isfield(opts,'optim')
-    opts.optim = optimset('Display','off','MaxIter',300,'MaxFunEvals',1500, ...
-                          'TolX',1e-3,'TolFun',1e-6);
+    opts.optim = optimset('Display','off','MaxIter',400,'MaxFunEvals',2000, ...
+        'TolX',1e-4,'TolFun',1e-7);
 end
-
-opts.eccEdges = double(opts.eccEdges(:).');
-opts.sigmaBounds = double(opts.sigmaBounds(:).');
-opts.nBounds = double(opts.nBounds(:).');
-opts.kBounds = double(opts.kBounds(:).');
+opts.eccEdges = double(opts.eccEdges(:).'); opts.sigmaBounds = double(opts.sigmaBounds(:).');
+opts.nBounds = double(opts.nBounds(:).'); opts.kBounds = double(opts.kBounds(:).');
 opts.cssStarts = double(opts.cssStarts(:).');
-if numel(opts.eccEdges) < 2 || any(~isfinite(opts.eccEdges)) || any(diff(opts.eccEdges) <= 0)
-    error('fitSampledPRFCSS:badEccEdges','eccEdges must increase strictly.');
+if numel(opts.eccEdges) < 2 || opts.eccEdges(1) < 0 || any(~isfinite(opts.eccEdges)) || ...
+        any(diff(opts.eccEdges) <= 0)
+    error('fitSampledPRFCSS:badEccEdges','eccEdges must increase from a nonnegative value.');
 end
-if numel(opts.sigmaBounds) ~= 2 || opts.sigmaBounds(1) <= 0 || opts.sigmaBounds(2) <= opts.sigmaBounds(1)
-    error('fitSampledPRFCSS:badSigmaBounds','sigmaBounds must be [positive lower, larger upper].');
+if numel(opts.sigmaBounds) ~= 2 || opts.sigmaBounds(1) <= 0 || ...
+        opts.sigmaBounds(2) <= opts.sigmaBounds(1)
+    error('fitSampledPRFCSS:badSigmaBounds','sigmaBounds must be increasing and positive.');
 end
-if numel(opts.nBounds) ~= 2 || any(~isfinite(opts.nBounds)) || ...
-        opts.nBounds(1) <= 0 || opts.nBounds(2) <= opts.nBounds(1)
-    error('fitSampledPRFCSS:badNBounds','nBounds must contain two increasing positive values.');
+if numel(opts.nBounds) ~= 2 || opts.nBounds(1) <= 0 || opts.nBounds(2) <= opts.nBounds(1) || ...
+        any(opts.cssStarts < opts.nBounds(1) | opts.cssStarts > opts.nBounds(2))
+    error('fitSampledPRFCSS:badNBounds','n bounds and starting values are inconsistent.');
 end
-if ~isscalar(opts.minMappingR2) || ~isfinite(opts.minMappingR2)
-    error('fitSampledPRFCSS:badMappingR2','minMappingR2 must be a finite scalar.');
-end
-if any(opts.cssStarts < opts.nBounds(1) | opts.cssStarts > opts.nBounds(2))
-    error('fitSampledPRFCSS:badCSSStarts','Every CSS start must lie within nBounds.');
-end
-if numel(opts.kBounds) ~= 2 || opts.kBounds(1) < 0 || opts.kBounds(2) > 1 || opts.kBounds(2) <= opts.kBounds(1)
+if numel(opts.kBounds) ~= 2 || opts.kBounds(1) < 0 || opts.kBounds(2) > 1 || ...
+        opts.kBounds(2) <= opts.kBounds(1)
     error('fitSampledPRFCSS:badKBounds','kBounds must increase within [0,1].');
 end
 end
 
-function beta = refitBeta(p,n,Y,Afull,hrf,x,y,TR,hemIdx)
-G = gaussianMatrix(p,x,y);
-nVox = size(p,1);
-num = zeros(nVox,1);
-den = zeros(nVox,1);
-for r = 1:numel(Y)
-    drive = max(Afull{r}*G,0);
-    P = cssPredict(drive,n,hrf,TR,hemIdx,r);
-    good = isfinite(P) & isfinite(Y{r});
-    P(~good) = 0;
-    Yr = Y{r}; Yr(~good) = 0;
-    num = num+sum(P.*Yr,1).';
-    den = den+sum(P.^2,1).';
+function validateSubject(S,D,x,y,s)
+requiredS = {'Yfull','Yscot','prfXY','sigma','w_vox','hemIdx'};
+requiredD = {'SfullRaw','SscotRaw','hrfParams','tStim','TR'};
+if ~isstruct(S) || ~all(isfield(S,requiredS)) || ~isstruct(D) || ~all(isfield(D,requiredD))
+    error('fitSampledPRFCSS:badSubject','Subject %d is incomplete.',s);
 end
-beta = num./den;
-beta(~isfinite(beta) | den <= eps | beta <= 0) = NaN;
+nRun = numel(S.Yfull); nVox = size(S.prfXY,1);
+if nRun == 0 || numel(S.Yscot) ~= nRun || numel(D.SfullRaw) ~= nRun || ...
+        numel(D.SscotRaw) ~= nRun || numel(D.tStim) ~= nRun || size(S.prfXY,2) ~= 2 || ...
+        numel(S.sigma) ~= nVox || numel(S.w_vox) ~= nVox || numel(S.hemIdx) ~= nVox
+    error('fitSampledPRFCSS:dimensionMismatch','Subject %d has inconsistent dimensions.',s);
 end
-
-function [pLin,bLin,sseLin,r2Lin,corrLin,pCss,bCss,sseCss,r2Css,corrCss] = ...
-    fitVoxelModels(Y,p0,args,h)
-centreBounds = [-args.centreLimit args.centreLimit];
-lbLin = [centreBounds(1) centreBounds(1) args.sigmaBounds(1)];
-ubLin = [centreBounds(2) centreBounds(2) args.sigmaBounds(2)];
-p0 = min(max(double(p0),lbLin+1e-6),ubLin-1e-6);
-objLin = @(p) fullObjective(p,1,Y,args,h);
-[pLin,sseLin] = fminsearchcon(objLin,p0,lbLin,ubLin,[],[],[],args.optim);
-pLin = pLin(:).';
-[sseLin,bLin,r2Lin,corrLin] = fullObjective(pLin,1,Y,args,h);
-lbCss = [lbLin args.nBounds(1)];
-ubCss = [ubLin args.nBounds(2)];
-[pCss,bCss,sseCss,r2Css,corrCss] = deal(nan);
-best = Inf;
-for n0 = args.cssStarts
-    sigma0 = min(max(pLin(3)*sqrt(n0),args.sigmaBounds(1)+1e-6),args.sigmaBounds(2)-1e-6);
-    start = [pLin(1:2) sigma0 n0];
-    objCss = @(p) fullObjective(p(1:3),p(4),Y,args,h);
-    [candidate,f] = fminsearchcon(objCss,start,lbCss,ubCss,[],[],[],args.optim);
-    candidate = candidate(:).';
-    if isfinite(f) && f < best
-        best = f;
-        pCss = candidate;
+for r = 1:nRun
+    if ~isequal(size(S.Yfull{r}),size(S.Yscot{r})) || size(S.Yfull{r},2) ~= nVox || ...
+            ~isequal(size(D.SfullRaw{r}),size(D.SscotRaw{r})) || ...
+            size(D.SfullRaw{r},1) ~= size(S.Yfull{r},1) || size(D.SfullRaw{r},2) ~= numel(x)
+        error('fitSampledPRFCSS:runDimensionMismatch', ...
+              'Subject %d, run %d has mismatched BOLD/stimulus dimensions.',s,r);
     end
 end
-if all(isfinite(pCss))
-    [sseCss,bCss,r2Css,corrCss] = fullObjective(pCss(1:3),pCss(4),Y,args,h);
-else
-    pCss = nan(1,4);
+if ~isequal(size(x),size(y)) || any(~isfinite(S.prfXY(:))) || ...
+        any(~isfinite(S.sigma(:)) | S.sigma(:) <= 0) || ...
+        any(double(S.hemIdx(:)) < 1 | double(S.hemIdx(:)) > numel(D.hrfParams))
+    error('fitSampledPRFCSS:invalidValues','Subject %d has invalid pRF or hemisphere values.',s);
 end
 end
 
-function [sse,beta,r2,rModel] = fullObjective(p,n,Y,args,h)
-if hypot(p(1),p(2)) > args.centreLimit
-    excess = hypot(p(1),p(2))-args.centreLimit;
-    sse = 1e12*(1+excess^2); beta = NaN; r2 = NaN; rModel = NaN;
-    return
+function sampled = sampleByBin(bin,nBin,nPerBin)
+sampled = [];
+for b = 1:nBin
+    idx = find(bin == b);
+    if isfinite(nPerBin) && numel(idx) > nPerBin, idx = idx(randperm(numel(idx),nPerBin)); end
+    sampled = [sampled;idx(:)]; %#ok<AGROW>
 end
-G = gaussian(p,args.x,args.y);
-P = cell(numel(args.Afull),1);
-for r = 1:numel(P)
-    drive = max(args.Afull{r}*G,0);
-    P{r} = cssPredict(drive,n,args.hrf,args.TR,h,r);
+end
+
+function hrf = makeHRFs(D,nRun)
+nHem = numel(D.hrfParams); hrf = cell(nHem,1);
+for h = 1:nHem
+    hrf{h} = cell(nRun,1);
+    for r = 1:nRun
+        hh = double(hrf_twogamma(D.hrfParams(h),D.tStim{r}));
+        if isempty(hh) || any(~isfinite(hh)), error('fitSampledPRFCSS:badHRF','Invalid HRF.'); end
+        hrf{h}{r} = hh(:);
+    end
+end
+end
+
+function [sLin,bLin,sseLin,r2Lin,corrLin,exitLin,sCss,nCss,bCss,sseCss,r2Css,corrCss,exitCss] = ...
+    fitVoxel(Y,xy,sigma0,args,hem)
+lb = args.sigmaBounds(1); ub = args.sigmaBounds(2);
+startSigma = min(max(sigma0,lb+1e-6),ub-1e-6);
+[pLin,~,exitLin] = fminsearchcon(@(p) fullObjective(xy,p(1),1,Y,args,hem), ...
+    startSigma,lb,ub,[],[],[],args.optim);
+sLin = pLin(1); [sseLin,bLin,r2Lin,corrLin] = fullObjective(xy,sLin,1,Y,args,hem);
+best = Inf; [sCss,nCss,bCss,sseCss,r2Css,corrCss,exitCss] = deal(NaN);
+for n0 = args.nStarts
+    start = [min(max(sLin*sqrt(n0),lb+1e-6),ub-1e-6),n0];
+    [candidate,f,flag] = fminsearchcon(@(p) fullObjective(xy,p(1),p(2),Y,args,hem), ...
+        start,[lb args.nBounds(1)],[ub args.nBounds(2)],[],[],[],args.optim);
+    if isfinite(f) && f < best
+        best = f; sCss = candidate(1); nCss = candidate(2); exitCss = flag;
+    end
+end
+if isfinite(sCss), [sseCss,bCss,r2Css,corrCss] = fullObjective(xy,sCss,nCss,Y,args,hem); end
+end
+
+function [sse,beta,r2,rModel] = fullObjective(xy,sigma,n,Y,args,hem)
+G = gaussian(xy,sigma,args.x,args.y); P = cell(numel(Y),1);
+for r = 1:numel(Y)
+    P{r} = cssPredict(nonnegative(args.Afull{r}*G),n,args.hrf,args.TR,hem,r);
 end
 [beta,sse,r2,rModel] = fitAmplitude(P,Y);
-if ~isfinite(sse), sse = 1e12; end
+if ~isfinite(sse), sse = realmax/1e100; end
 end
 
 function [beta,sse,r2,rModel] = fitAmplitude(P,Y)
-num = 0; den = 0; sst = 0;
+num = 0; den = 0; sst = 0; allP = []; allY = [];
 for r = 1:numel(P)
-    good = isfinite(P{r}) & isfinite(Y{r});
-    pr = P{r}(good); yr = Y{r}(good);
+    good = isfinite(P{r}) & isfinite(Y{r}); pr = P{r}(good); yr = Y{r}(good);
     num = num+sum(pr.*yr); den = den+sum(pr.^2); sst = sst+sum(yr.^2);
 end
-if den <= eps || sst <= eps
-    beta = NaN; sse = Inf; r2 = NaN; rModel = NaN;
-    return
-end
-beta = max(num/den,0);
-sse = 0; allP = []; allY = [];
+if den <= eps || sst <= eps, beta = NaN; sse = Inf; r2 = NaN; rModel = NaN; return, end
+beta = num/den;
+if ~isfinite(beta) || beta <= 0, beta = NaN; sse = Inf; r2 = NaN; rModel = NaN; return, end
+sse = 0;
 for r = 1:numel(P)
-    good = isfinite(P{r}) & isfinite(Y{r});
-    pr = beta*P{r}(good); yr = Y{r}(good);
-    sse = sse+sum((yr-pr).^2);
-    allP = [allP;pr(:)]; allY = [allY;yr(:)]; %#ok<AGROW>
+    good = isfinite(P{r}) & isfinite(Y{r}); pr = beta*P{r}(good); yr = Y{r}(good);
+    sse = sse+sum((yr-pr).^2); allP = [allP;pr(:)]; allY = [allY;yr(:)]; %#ok<AGROW>
 end
 r2 = 1-sse/sst;
 if numel(allP) > 1 && std(allP) > 0 && std(allY) > 0
@@ -391,140 +265,103 @@ else
 end
 end
 
-function k = fitK(p,n,beta,Y,Afull,Ascot,hrf,x,y,opts,hemIdx)
-G = gaussianMatrix(p,x,y);
-driveS = cell(numel(Afull),1); driveD = cell(numel(Afull),1);
-for r = 1:numel(Afull)
-    driveS{r} = max(Ascot{r}*G,0);
-    driveD{r} = max((Afull{r}-Ascot{r})*G,0);
+function [k,atBoundary] = fitK(xy,sigma,n,beta,Y,D,hrf,x,y,hemIdx,opts)
+G = gaussianMatrix(xy,sigma,x,y); driveS = cell(numel(Y),1); driveD = cell(numel(Y),1);
+for r = 1:numel(Y)
+    driveS{r} = nonnegative(double(D.SscotRaw{r})*G);
+    driveD{r} = nonnegative((double(D.SfullRaw{r})-double(D.SscotRaw{r}))*G);
 end
-objective = @(v) kObjective(v,driveS,driveD,n,beta,Y,hrf,opts.TR,hemIdx);
+objective = @(v) kObjective(v,driveS,driveD,n,beta,Y,hrf,D.TR,hemIdx);
 grid = opts.kBounds(1):opts.kGridStep:opts.kBounds(2);
 if grid(end) < opts.kBounds(2), grid = [grid opts.kBounds(2)]; end
-sse = arrayfun(objective,grid);
-[~,ii] = min(sse);
-k = grid(ii);
+sse = arrayfun(objective,grid); [best,ii] = min(sse); k = grid(ii);
 if ii > 1 && ii < numel(grid)
-    o = optimset('Display','off','TolX',1e-3);
-    [candidate,f] = fminbnd(objective,grid(ii-1),grid(ii+1),o);
-    if f < sse(ii), k = candidate; end
+    [candidate,f] = fminbnd(objective,grid(ii-1),grid(ii+1),optimset('Display','off','TolX',1e-4));
+    if f < best, k = candidate; best = f; end
 end
+if ~isfinite(best), k = NaN; end
+atBoundary = isfinite(k) && min(abs(k-opts.kBounds)) <= opts.boundaryTol;
 end
 
 function sse = kObjective(k,driveS,driveD,n,beta,Y,hrf,TR,hemIdx)
-sse = 0;
+sse = 0; nGood = 0;
 for r = 1:numel(Y)
     P = cssPredict(driveS{r}+k*driveD{r},n,hrf,TR,hemIdx,r);
-    R = Y{r}-P.*beta(:).';
-    R = R(isfinite(R));
-    sse = sse+sum(R.^2);
+    R = Y{r}-P.*beta(:).'; good = isfinite(R);
+    sse = sse+sum(R(good).^2); nGood = nGood+nnz(good);
 end
-if ~isfinite(sse), sse = Inf; end
+if nGood == 0 || ~isfinite(sse), sse = Inf; end
 end
 
-function T = summarizeResults(kLin,kCss,nVox,medianNBySubject, ...
-    medianLinearSigmaBySubject,medianCssEffectiveSigmaBySubject,roi,opts)
-nBin = size(kLin,2);
-ecc = ((opts.eccEdges(1:end-1)+opts.eccEdges(2:end))/2).';
-[meanLin,seLin,meanCss,seCss,delta,seDelta] = deal(nan(nBin,1));
-nSubjects = zeros(nBin,1); nVoxTotal = zeros(nBin,1);
-[meanN,seN,meanLinearSigma,seLinearSigma,meanCssEffectiveSigma,seCssEffectiveSigma, ...
- meanEffectiveSizeRatio,seEffectiveSizeRatio] = ...
-    deal(nan(nBin,1));
+function T = summarize(kLin,kCss,nVox,medianN,medianLinSigma,medianCssEff,linBoundary,cssBoundary,roi,opts)
+nBin = size(kLin,2); ecc = ((opts.eccEdges(1:end-1)+opts.eccEdges(2:end))/2).';
+[meanLin,seLin,meanCss,seCss,delta,seDelta,meanN,seN,meanLinSigma,seLinSigma, ...
+ meanCssEff,seCssEff,meanRatio,seRatio] = deal(nan(nBin,1));
+[nSubjects,nVoxTotal,nLinearBoundary,nCssBoundary] = deal(zeros(nBin,1));
 for b = 1:nBin
     q = isfinite(kLin(:,b)) & isfinite(kCss(:,b));
     nSubjects(b) = nnz(q); nVoxTotal(b) = sum(nVox(q,b));
-    if any(q)
-        lin = kLin(q,b); css = kCss(q,b); dif = css-lin;
-        meanLin(b) = mean(lin); meanCss(b) = mean(css); delta(b) = mean(dif);
-        seLin(b) = standardError(lin);
-        seCss(b) = standardError(css);
-        seDelta(b) = standardError(dif);
-    end
-    [meanN(b),seN(b)] = meanAndSE(medianNBySubject(:,b));
-    [meanLinearSigma(b),seLinearSigma(b)] = meanAndSE(medianLinearSigmaBySubject(:,b));
-    [meanCssEffectiveSigma(b),seCssEffectiveSigma(b)] = ...
-        meanAndSE(medianCssEffectiveSigmaBySubject(:,b));
-    ratio = medianCssEffectiveSigmaBySubject(:,b)./medianLinearSigmaBySubject(:,b);
-    [meanEffectiveSizeRatio(b),seEffectiveSizeRatio(b)] = meanAndSE(ratio);
+    [meanLin(b),seLin(b)] = meanAndSE(kLin(q,b));
+    [meanCss(b),seCss(b)] = meanAndSE(kCss(q,b));
+    [delta(b),seDelta(b)] = meanAndSE(kCss(q,b)-kLin(q,b));
+    nLinearBoundary(b) = nnz(linBoundary(q,b)); nCssBoundary(b) = nnz(cssBoundary(q,b));
+    [meanN(b),seN(b)] = meanAndSE(medianN(:,b));
+    [meanLinSigma(b),seLinSigma(b)] = meanAndSE(medianLinSigma(:,b));
+    [meanCssEff(b),seCssEff(b)] = meanAndSE(medianCssEff(:,b));
+    [meanRatio(b),seRatio(b)] = meanAndSE(medianCssEff(:,b)./medianLinSigma(:,b));
 end
-T = table(repmat(roi,nBin,1),ecc,nSubjects,nVoxTotal, ...
-    meanLin,seLin,meanCss,seCss,delta,seDelta,meanN,seN, ...
-    meanLinearSigma,seLinearSigma,meanCssEffectiveSigma,seCssEffectiveSigma, ...
-    meanEffectiveSizeRatio,seEffectiveSizeRatio, ...
-    'VariableNames',{'ROI','ecc','nSubjects','nVox','kLinear','kLinear_se', ...
-    'kCSS','kCSS_se','deltaK','deltaK_se','medianCssN','medianCssN_se', ...
-    'medianLinearSigma','medianLinearSigma_se','medianCssEffectiveSigma', ...
-    'medianCssEffectiveSigma_se','medianEffectiveSizeRatio', ...
-    'medianEffectiveSizeRatio_se'});
+T = table(repmat(roi,nBin,1),ecc,nSubjects,nVoxTotal,meanLin,seLin,meanCss,seCss, ...
+    delta,seDelta,meanN,seN,meanLinSigma,seLinSigma,meanCssEff,seCssEff,meanRatio,seRatio, ...
+    nLinearBoundary,nCssBoundary,'VariableNames',{'ROI','ecc','nSubjects','nVox', ...
+    'kLinear','kLinear_se','kCSS','kCSS_se','deltaK','deltaK_se','medianCssN', ...
+    'medianCssN_se','medianLinearSigma','medianLinearSigma_se','medianCssEffectiveSigma', ...
+    'medianCssEffectiveSigma_se','medianEffectiveSizeRatio','medianEffectiveSizeRatio_se', ...
+    'nLinearKAtBoundary','nCSSKAtBoundary'});
 end
 
-function [Afull,Ascot,stimTime] = loadRawStimuli(nRun,TR,x,y)
-Afull = cell(nRun,1); Ascot = cell(nRun,1); stimTime = cell(nRun,1);
-for r = 1:nRun
-    [imgF,funcF] = loadScotomaStimuli(r,'logbar',TR);
-    [imgS,funcS] = loadScotomaStimuli(r,'scotoma',TR);
-    same = isequal(size(imgF),size(imgS)) && isequal(size(funcF.x),size(x)) && ...
-           isequal(size(funcF.y),size(y)) && max(abs(funcF.x(:)-x(:))) <= 1e-10 && ...
-           max(abs(funcF.y(:)-y(:))) <= 1e-10 && ...
-           isequal(size(funcF.x),size(funcS.x)) && isequal(size(funcF.y),size(funcS.y)) && ...
-           max(abs(funcF.x(:)-funcS.x(:))) <= 1e-10 && ...
-           max(abs(funcF.y(:)-funcS.y(:))) <= 1e-10 && ...
-           isequal(size(funcF.t),size(funcS.t)) && ...
-           max(abs(funcF.t(:)-funcS.t(:))) <= 1e-10;
-    if ~same
-        error('fitSampledPRFCSS:stimulusMismatch','Stimulus or grid mismatch in run %d.',r);
-    end
-    nt = numel(funcF.t); nPix = numel(funcF.x);
-    Afull{r} = reshape(double(imgF),[nPix nt]).';
-    Ascot{r} = reshape(double(imgS),[nPix nt]).';
-    stimTime{r} = double(funcF.t(:).');
-end
+function q = atBounds(v,bounds,tol)
+q = isfinite(v) & (abs(v-bounds(1)) <= tol | abs(v-bounds(2)) <= tol);
 end
 
-function G = gaussian(p,x,y)
-G = exp(-((double(x)-p(1)).^2+(double(y)-p(2)).^2)/(2*p(3)^2));
-G = G(:);
-mass = sum(G);
+function G = gaussian(xy,sigma,x,y)
+if numel(xy) ~= 2 || ~isfinite(sigma) || sigma <= 0, G = nan(numel(x),1); return, end
+z = -((double(x)-xy(1)).^2+(double(y)-xy(2)).^2)/(2*sigma^2); z = z-max(z(:));
+G = exp(z(:)); mass = sum(G);
 if ~isfinite(mass) || mass <= 0, G(:) = NaN; else, G = G/mass; end
 end
 
-function G = gaussianMatrix(p,x,y)
-G = zeros(numel(x),size(p,1));
-for v = 1:size(p,1), G(:,v) = gaussian(p(v,:),x,y); end
+function G = gaussianMatrix(xy,sigma,x,y)
+G = nan(numel(x),size(xy,1));
+for v = 1:size(xy,1), G(:,v) = gaussian(xy(v,:),sigma(v),x,y); end
+end
+
+function drive = nonnegative(drive)
+drive(isfinite(drive) & drive < 0) = 0;
 end
 
 function Y = cssPredict(drive,n,hrf,TR,hemIdx,r)
-% drive is [nT x nVox]. hrf{h}{r} is the HRF for hemisphere h on run r, and
-% hemIdx says which hemisphere each column belongs to (scalar when every
-% column shares one). The exponent is applied BEFORE convolution, so this
-% cannot be folded into a pre-convolved design.
-neural = bsxfun(@power,max(drive,0),double(n(:).'));
-Y = centre(convByHemisphere(neural,hrf,TR,hemIdx,r));
+Y = centre(convByHemisphere(bsxfun(@power,nonnegative(drive),double(n(:).')), ...
+                            hrf,TR,hemIdx,r));
 end
 
-function Y = selectVoxel(Yall,v)
-Y = cell(size(Yall));
-for r = 1:numel(Yall), Y{r} = Yall{r}(:,v); end
+function Y = selectColumns(C,idx)
+Y = cell(size(C)); for r = 1:numel(C), Y{r} = centre(double(C{r}(:,idx))); end
 end
 
-function Y = selectVoxels(Yall,q)
-Y = cell(size(Yall));
-for r = 1:numel(Yall), Y{r} = Yall{r}(:,q); end
+function Y = selectVoxel(C,v)
+Y = cell(size(C)); for r = 1:numel(C), Y{r} = C{r}(:,v); end
+end
+
+function Y = selectVoxels(C,q)
+Y = cell(size(C)); for r = 1:numel(C), Y{r} = C{r}(:,q); end
 end
 
 function Z = centre(Z)
 Z = Z-mean(Z,1,'omitnan');
 end
 
-function [m,se] = meanAndSE(x)
-x = x(isfinite(x));
-if isempty(x), m = NaN; se = NaN; return, end
-m = mean(x);
-se = standardError(x);
-end
-
-function se = standardError(x)
-x = x(isfinite(x));
-if numel(x) < 2, se = NaN; else, se = std(x,0)/sqrt(numel(x)); end
+function [m,se] = meanAndSE(v)
+v = v(isfinite(v));
+if isempty(v), m = NaN; se = NaN; return, end
+m = mean(v); if numel(v) < 2, se = NaN; else, se = std(v,0)/sqrt(numel(v)); end
 end
