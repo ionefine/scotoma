@@ -1,20 +1,24 @@
 function subjectDataSim = simulateSubjectDataWithFilling(subjectData, stimData, noiseSD, fillFrac, opts)
 % simulateSubjectDataWithFilling
 %
-% Simulate data with a filling-in fraction:
+% Simulate either of the two filling-in parameterizations:
 %
-%   Ssim = (1-fillFrac)*Sscot + fillFrac*Sfull
+%   k:  Ssim = Sscot + fillFrac*(Sfull-Sscot)
+%   k2: Ssim = Sscot + fillFrac*Sfull
 %
-% fillFrac = 0  -> no filling-in
-% fillFrac = 1  -> full stimulus restored
+% For k, fillFrac=0 is no filling-in and fillFrac=1 restores the full
+% stimulus. For k2, fillFrac is the fraction of the full-field stimulus
+% added to the scotoma stimulus; outside the scotoma it is a gain change.
 %
 % Returns a structure identical to subjectData in shape.
 %
 % INPUTS
 %   subjectData   cell array of subject structs
-%   stimData      struct with Sfull{r}, Sscot{r}
+%   stimData      cell array matching subjectData; each entry contains
+%                 Sfull{r}, Sscot{r}. A single struct is accepted for one
+%                 subject.
 %   noiseSD       scalar noise SD
-%   fillFrac      scalar in [0,1]
+%   fillFrac      finite scalar (normally in [0,1])
 %
 % opts fields:
 %   .useVoxelGain   default false
@@ -22,6 +26,7 @@ function subjectDataSim = simulateSubjectDataWithFilling(subjectData, stimData, 
 %   .rngSeed        default []
 %   .verbose        default true
 %   .zeroMean       default true
+%   .fillMeasure    'k' (default) or 'k2'
 %
 % OUTPUT
 %   subjectDataSim  cell array matching subjectData, but with simulated
@@ -33,13 +38,41 @@ function subjectDataSim = simulateSubjectDataWithFilling(subjectData, stimData, 
     if ~isfield(opts,'rngSeed'),      opts.rngSeed = []; end
     if ~isfield(opts,'verbose'),      opts.verbose = true; end
     if ~isfield(opts,'zeroMean'),     opts.zeroMean = true; end
+    if ~isfield(opts,'fillMeasure'),  opts.fillMeasure = 'k'; end
+
+    if ~iscell(subjectData), subjectData = {subjectData}; end
+    if isempty(subjectData)
+        error('simulateSubjectDataWithFilling:noSubjects','subjectData is empty.');
+    end
+
+    if ~isscalar(fillFrac) || ~isfinite(fillFrac)
+        error('simulateSubjectDataWithFilling:badFillFrac', ...
+              'fillFrac must be a finite scalar.');
+    end
+    if ~any(strcmpi(opts.fillMeasure,{'k','k2'}))
+        error('simulateSubjectDataWithFilling:badFillMeasure', ...
+              'opts.fillMeasure must be ''k'' or ''k2''.');
+    end
+    if ~isscalar(noiseSD) || ~isfinite(noiseSD) || noiseSD < 0
+        error('simulateSubjectDataWithFilling:badNoise','noiseSD must be nonnegative.');
+    end
+    if numel(opts.gainRange) ~= 2 || any(~isfinite(opts.gainRange)) || ...
+       opts.gainRange(2) < opts.gainRange(1)
+        error('simulateSubjectDataWithFilling:badGainRange','opts.gainRange must be [min max].');
+    end
+    if ~iscell(stimData), stimData = {stimData}; end
 
     if ~isempty(opts.rngSeed)
+        oldRng = rng;
+        restoreRng = onCleanup(@() rng(oldRng)); %#ok<NASGU>
         rng(opts.rngSeed);
     end
 
     nSub = numel(subjectData);
-    nRun = numel(stimData.Sfull);
+    if numel(stimData) ~= nSub
+        error('simulateSubjectDataWithFilling:stimulusCount', ...
+              'stimData must contain one entry per subject.');
+    end
 
     subjectDataSim = subjectData;
 
@@ -49,7 +82,33 @@ function subjectDataSim = simulateSubjectDataWithFilling(subjectData, stimData, 
         end
 
         G = double(subjectData{s}.Gprf);
+        gMass = sum(G,1);
+        if any(~isfinite(G(:))) || any(~isfinite(gMass) | gMass <= 0)
+            error('simulateSubjectDataWithFilling:badGaussian', ...
+                  'Subject %d has nonfinite Gprf values or nonpositive pRF mass.',s);
+        end
+        G = G ./ gMass;
         [~, nVox] = size(G);
+        nRun = numel(stimData{s}.SfullRaw);
+        if nRun == 0 || numel(stimData{s}.SscotRaw) ~= nRun
+            error('simulateSubjectDataWithFilling:runMismatch', ...
+                  'SfullRaw and SscotRaw run counts disagree for subject %d.',s);
+        end
+        % One HRF per hemisphere; the stored designs are unconvolved.
+        nHem = numel(stimData{s}.hrfParams);
+        hemIdx = double(subjectData{s}.hemIdx(:).');
+        if numel(hemIdx) ~= nVox || any(hemIdx < 1 | hemIdx > nHem)
+            error('simulateSubjectDataWithFilling:badHemIdx', ...
+                  'hemIdx for subject %d is missing or indexes outside hrfParams.',s);
+        end
+        hrf = cell(nHem,1);
+        for h = 1:nHem
+            hrf{h} = cell(nRun,1);
+            for r = 1:nRun
+                hh = double(hrf_twogamma(stimData{s}.hrfParams(h),stimData{s}.tStim{r}));
+                hrf{h}{r} = hh(:);
+            end
+        end
 
         if opts.useVoxelGain
             gmin = opts.gainRange(1);
@@ -60,15 +119,24 @@ function subjectDataSim = simulateSubjectDataWithFilling(subjectData, stimData, 
         end
 
         for r = 1:nRun
-            Sfull = double(stimData.Sfull{r});
-            Sscot = double(stimData.Sscot{r});
+            Sfull = double(stimData{s}.SfullRaw{r});
+            Sscot = double(stimData{s}.SscotRaw{r});
+            if ~isequal(size(Sfull),size(Sscot)) || size(Sfull,2) ~= size(G,1)
+                error('simulateSubjectDataWithFilling:dimensionMismatch', ...
+                      'Stimulus/G dimensions disagree for subject %d, run %d.',s,r);
+            end
 
-            % Mixture stimulus
-            Ssim = (1 - fillFrac) * Sscot + fillFrac * Sfull;
+            switch lower(opts.fillMeasure)
+                case 'k'
+                    Ssim = Sscot + fillFrac*(Sfull-Sscot);
+                case 'k2'
+                    Ssim = Sscot + fillFrac*Sfull;
+            end
 
-            % Forward model
-            Yfull = Sfull * G;
-            Ysim  = Ssim  * G;
+            % Forward model: project onto each pRF, then convolve with that
+            % voxel's own hemisphere HRF.
+            Yfull = convByHemisphere(Sfull * G,hrf,stimData{s}.TR,hemIdx,r);
+            Ysim  = convByHemisphere(Ssim  * G,hrf,stimData{s}.TR,hemIdx,r);
 
             % Optional voxel gain
             Yfull = Yfull .* voxelGain';

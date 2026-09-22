@@ -1,5 +1,5 @@
-function [hrf] = hrf_twogamma(params,t)
-% [hrf] = hrf_twogamma(params,t)
+function hrf = hrf_twogamma(params,t)
+% hrf_twogamma  Evaluate the SPM-style two-gamma HRF.
 %
 % SPM's Two Gamma HRF function
 %
@@ -31,9 +31,21 @@ function [hrf] = hrf_twogamma(params,t)
 % Written by Kelly Chang - June 20, 2017
 % Edited by Kelly Chang - July 14, 2022
 
-%% Two Gamma HRF
-
-t = t - params.delta;
-hrf = ((t.^(params.a1 - 1) .* params.b1.^(params.a1) .* exp(-params.b1 .* t)) ./ gamma(params.a1)) - ...
-    ((t.^(params.a2 - 1) .* params.b2 .^ (params.a2) .* exp(-params.b2 .* t)) / (params.c .* gamma(params.a2)));
-hrf(t < 0) = 0;
+required = {'delta','c','a1','a2','b1','b2'};
+if ~isstruct(params) || ~isscalar(params) || ~all(isfield(params,required))
+    error('hrf_twogamma:badParameters','params must contain delta, c, a1, a2, b1, and b2.');
+end
+values = cellfun(@(name) params.(name),required);
+if any(~isfinite(values)) || params.c <= 0 || params.a1 <= 0 || ...
+        params.a2 <= 0 || params.b1 <= 0 || params.b2 <= 0
+    error('hrf_twogamma:badParameters','Gamma shape, rate, and ratio parameters must be positive.');
+end
+validateattributes(t,{'numeric'},{'real','finite','vector','nonempty'},mfilename,'t');
+shiftedTime = double(t)-params.delta;
+positiveTime = max(shiftedTime,0);
+response = positiveTime.^(params.a1-1).*params.b1.^params.a1.* ...
+           exp(-params.b1.*positiveTime)./gamma(params.a1);
+undershoot = positiveTime.^(params.a2-1).*params.b2.^params.a2.* ...
+             exp(-params.b2.*positiveTime)./(params.c*gamma(params.a2));
+hrf = response-undershoot;
+hrf(shiftedTime < 0) = 0;
